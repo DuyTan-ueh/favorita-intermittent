@@ -1,0 +1,22 @@
+# Dữ liệu — KHÔNG commit. Giấy phép Kaggle cấm phân phối lại dữ liệu gốc.
+data/
+*.csv
+*.7z
+*.parquet
+
+# Kết quả chạy
+artifacts/
+*.log
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ipynb_checkpoints/
+venv/
+.venv/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store

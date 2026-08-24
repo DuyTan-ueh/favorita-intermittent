@@ -1,0 +1,47 @@
+# =============================================================================
+# Cấu hình pipeline — mọi tham số thực nghiệm nằm ở đây, KHÔNG hard-code trong code
+# Đổi thí nghiệm = copy file này, sửa, chạy với --config
+# =============================================================================
+
+run:
+  name: "baseline_h7"
+  seed: 42
+
+data:
+  # Mốc cắt: onpromotion trống 100% trước ngày này (đã kiểm chứng thực nghiệm)
+  start_date: "2014-04-01"
+  end_date: null            # null = lấy tới hết dữ liệu
+
+  # Tiêu chí lọc chuỗi (đã khảo sát ở bước profiling)
+  min_days_active: 365      # đủ lịch sử cho lag/rolling dài nhất
+  min_positive_days: 50     # đủ mẫu dương để Stage 2 huấn luyện được
+  require_active_until_end: 60   # còn bán trong N ngày cuối -> loại hàng đã ngừng KD
+
+sampling:
+  enabled: true
+  n_series: 25000           # 133k chuỗi vượt RAM; lấy mẫu phân tầng
+  stratify_by: "pattern"    # giữ nguyên tỷ lệ 4 nhóm Syntetos-Boylan
+
+forecast:
+  horizon: 7                # dự báo bao nhiêu ngày tới
+  # RÀNG BUỘC: mọi lag phải >= horizon (validate tự động lúc load config)
+
+features:
+  lags: [7, 14, 21, 28]     # đều >= horizon
+  rolling_windows: [7, 14, 28, 56]
+  rolling_stats: ["mean", "std"]
+  use_calendar: true
+  use_promotion: true
+  use_holidays: true
+  use_static: true          # family / class / perishable / store type / cluster
+
+split:
+  # Rolling-origin backtesting — KHÔNG random split
+  n_folds: 3
+  test_days: 28             # mỗi fold test 28 ngày
+  gap_days: 0               # khoảng đệm giữa train và test
+
+output:
+  dir: "artifacts"
+  format: "parquet"
+  batch_size: 5000          # số chuỗi xử lý mỗi lô, kiểm soát bộ nhớ

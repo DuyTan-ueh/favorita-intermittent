@@ -1,0 +1,10 @@
+pandas>=2.0
+numpy>=1.24
+pyyaml>=6.0
+pyarrow>=14.0
+pytest>=7.0
+
+# Cho các bước sau (baseline + mô hình)
+# statsforecast>=1.7    # Croston, SBA, TSB
+# xgboost>=2.0
+# scikit-learn>=1.3
