@@ -186,6 +186,14 @@ def select_series(cfg: Config, stats: pd.DataFrame) -> pd.DataFrame:
     if cfg.sampling["enabled"] and len(kept) > cfg.sampling["n_series"]:
         kept = _stratified_sample(kept, cfg)
 
+    # Xáo trộn trước khi chia lô. Thứ tự tự nhiên của dữ liệu phản ánh thời
+    # điểm chuỗi xuất hiện lần đầu, nên nếu giữ nguyên thì lô đầu toàn chuỗi
+    # có lịch sử dài (ít ngày không bán) còn lô cuối toàn chuỗi ra mắt muộn
+    # (nhiều ngày không bán). Khi đó mỗi tệp kết quả là một mẫu thiên lệch —
+    # nguy hiểm vì bước huấn luyện sau này thường chỉ nạp một phần tệp để
+    # tiết kiệm bộ nhớ, và sự thiên lệch đó không hề báo lỗi.
+    kept = kept.sample(frac=1.0, random_state=cfg.seed)
+
     print(f"\nTập cuối: {len(kept):,} chuỗi | "
           f"zero-demand TB {kept.zero_pct.mean():.1f}%")
     print(kept.pattern.value_counts().to_string())

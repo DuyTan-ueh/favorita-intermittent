@@ -40,6 +40,10 @@ split:
   n_folds: 3
   test_days: 28             # mỗi fold test 28 ngày
   gap_days: 0               # khoảng đệm giữa train và test
+  # Sinh thêm định nghĩa fold cho từng giá trị gap để so sánh ở bước huấn
+  # luyện. gap=0 giả định huấn luyện lại mỗi ngày; gap=horizon mô phỏng huấn
+  # luyện một lần rồi dự báo cả chu kỳ mà không cập nhật.
+  gap_variants: [0, 7]
 
 output:
   dir: "artifacts"

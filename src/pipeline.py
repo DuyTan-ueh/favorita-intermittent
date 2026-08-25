@@ -73,6 +73,7 @@ def run_features(cfg: Config, selected: pd.DataFrame) -> None:
 
     n_rows = 0
     leak_checked = False
+    batch_stats = []
 
     for i, g in grid.iter_grid_batches(cfg, selected, sales):
         out = _engineer(g, cfg)
@@ -88,15 +89,31 @@ def run_features(cfg: Config, selected: pd.DataFrame) -> None:
             checks.check_feature_nulls(out, cfg)
             leak_checked = True
 
+        batch_stats.append({
+            "batch": i,
+            "n_rows": len(out),
+            "n_series": out.groupby(["store_nbr", "item_nbr"]).ngroups,
+            "zero_pct": round(float((out.y == 0).mean() * 100), 1),
+        })
+
         out.to_parquet(feat_dir / f"part_{i:04d}.parquet", index=False)
         n_rows += len(out)
         del out, g
         gc.collect()
 
-    folds = checks.rolling_origin_folds(
-        pd.DataFrame({"date": pd.date_range(
-            selected.first_date.min(), selected.global_end.iloc[0])}), cfg)
-    checks.assert_folds_ordered(folds, cfg)
+    homogeneity = checks.check_batch_homogeneity(batch_stats)
+    homogeneity.to_csv(cfg.out_dir / "batch_stats.csv", index=False)
+
+    _banner("ĐỊNH NGHĨA FOLD")
+    calendar = pd.DataFrame({"date": pd.date_range(
+        selected.first_date.min(), selected.global_end.iloc[0])})
+    fold_variants = checks.build_fold_variants(calendar, cfg)
+
+    for gap, folds in fold_variants.items():
+        path = cfg.out_dir / f"folds_gap{gap}.json"
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump([{k: str(v) for k, v in f.items()} for f in folds],
+                      fh, indent=2)
 
     meta = {
         "run_name": cfg.run["name"],
@@ -104,7 +121,9 @@ def run_features(cfg: Config, selected: pd.DataFrame) -> None:
         "n_rows": int(n_rows),
         "horizon": cfg.horizon,
         "n_features": len(specs),
-        "folds": [{k: str(v) for k, v in f.items()} for f in folds],
+        "gap_variants": list(fold_variants.keys()),
+        "folds": {str(gap): [{k: str(v) for k, v in f.items()} for f in folds]
+                  for gap, folds in fold_variants.items()},
         "config": cfg.raw,
     }
     with open(cfg.out_dir / "metadata.json", "w", encoding="utf-8") as fh:
@@ -112,6 +131,7 @@ def run_features(cfg: Config, selected: pd.DataFrame) -> None:
 
     _banner("HOÀN TẤT")
     print(f"  {n_rows:,} dòng | {len(specs)} đặc trưng")
+    print(f"  Bộ fold: {', '.join(f'gap={g}' for g in fold_variants)}")
     print(f"  Kết quả: {cfg.out_dir}")
 
 

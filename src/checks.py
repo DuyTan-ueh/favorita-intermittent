@@ -112,6 +112,37 @@ def assert_no_leakage(engineer_fn, grid: pd.DataFrame, cfg: Config,
           f"{pd.Timestamp(cut_date).date()}")
 
 
+def check_batch_homogeneity(batch_stats: list[dict],
+                            max_spread_pct: float = 10.0) -> pd.DataFrame:
+    """Cảnh báo nếu các lô lệch nhau quá nhiều về đặc tính dữ liệu.
+
+    Mỗi lô được ghi ra một tệp riêng, và bước huấn luyện thường chỉ nạp một
+    phần các tệp đó để tiết kiệm bộ nhớ. Nếu các lô không đồng nhất, mẫu thu
+    được sẽ thiên lệch mà không có dấu hiệu nào báo lỗi — dạng hỏng âm thầm.
+
+    Nguyên nhân thường gặp là quên xáo trộn thứ tự chuỗi trước khi chia lô,
+    khiến lô đầu gom toàn chuỗi lịch sử dài còn lô cuối toàn chuỗi ra mắt muộn.
+    """
+    df = pd.DataFrame(batch_stats)
+    if len(df) < 2:
+        return df
+
+    spread = df.zero_pct.max() - df.zero_pct.min()
+    size_ratio = df.n_rows.min() / df.n_rows.max()
+
+    print("\n--- Đồng nhất giữa các lô ---")
+    print(df.to_string(index=False))
+    print(f"  Chênh lệch zero-demand : {spread:.1f} điểm phần trăm")
+    print(f"  Tỷ lệ kích thước nhỏ/lớn: {size_ratio:.2f}")
+
+    if spread > max_spread_pct:
+        print(f"  [CẢNH BÁO] các lô lệch quá {max_spread_pct} điểm — "
+              f"kiểm tra lại việc xáo trộn chuỗi trước khi chia lô")
+    else:
+        print("  [đạt] các lô đồng nhất")
+    return df
+
+
 def check_feature_nulls(df: pd.DataFrame, cfg: Config,
                         max_null_rate: float = 0.5) -> pd.DataFrame:
     """Cảnh báo đặc trưng thiếu giá trị quá nhiều.
@@ -134,7 +165,9 @@ def check_feature_nulls(df: pd.DataFrame, cfg: Config,
 # --------------------------------------------------------------------------- #
 # Chia tập theo thời gian
 # --------------------------------------------------------------------------- #
-def rolling_origin_folds(df: pd.DataFrame, cfg: Config) -> list[dict]:
+def rolling_origin_folds(df: pd.DataFrame, cfg: Config,
+                         gap_days: int | None = None,
+                         verbose: bool = True) -> list[dict]:
     """Sinh các fold theo kiểu rolling-origin.
 
     Chuỗi thời gian không được chia ngẫu nhiên: làm vậy là huấn luyện trên
@@ -142,11 +175,21 @@ def rolling_origin_folds(df: pd.DataFrame, cfg: Config) -> list[dict]:
     dịch cửa sổ kiểm tra về phía sau, mô phỏng đúng cách mô hình được dùng
     trong thực tế.
 
-    Tham số ``gap_days`` chèn khoảng đệm giữa huấn luyện và kiểm tra. Nên đặt
-    bằng ``horizon`` nếu muốn chặt chẽ tuyệt đối, tránh việc dòng cuối tập
-    huấn luyện và dòng đầu tập kiểm tra chia sẻ cùng cửa sổ lịch sử.
+    Tham số ``gap_days`` chèn khoảng đệm giữa huấn luyện và kiểm tra, và lựa
+    chọn giá trị nào phản ánh một giả định vận hành khác nhau:
+
+      ``gap = 0``
+          Ngầm định mô hình được huấn luyện lại mỗi ngày, luôn có dữ liệu tới
+          sát thời điểm dự báo. Đây là kịch bản lạc quan.
+
+      ``gap = horizon``
+          Mô hình huấn luyện một lần rồi dự báo trọn chu kỳ mà không cập nhật.
+          Sát thực tế vận hành hơn, và cũng chặt chẽ hơn vì loại bỏ khả năng
+          dòng cuối tập huấn luyện và dòng đầu tập kiểm tra chia sẻ cùng cửa
+          sổ lịch sử.
     """
     s = cfg.split
+    gap = s["gap_days"] if gap_days is None else gap_days
     end = df.date.max()
     folds = []
 
@@ -154,25 +197,47 @@ def rolling_origin_folds(df: pd.DataFrame, cfg: Config) -> list[dict]:
         offset = (s["n_folds"] - 1 - i) * s["test_days"]
         test_end = end - pd.Timedelta(days=offset)
         test_start = test_end - pd.Timedelta(days=s["test_days"] - 1)
-        train_end = test_start - pd.Timedelta(days=s["gap_days"] + 1)
+        train_end = test_start - pd.Timedelta(days=gap + 1)
 
         folds.append({
             "fold": i,
+            "gap_days": gap,
             "train_start": df.date.min(),
             "train_end": train_end,
             "test_start": test_start,
             "test_end": test_end,
         })
 
-    print("\n--- Các fold rolling-origin ---")
-    for f in folds:
-        print(f"  fold {f['fold']}: train tới {f['train_end'].date()} | "
-              f"test {f['test_start'].date()} -> {f['test_end'].date()}")
+    if verbose:
+        print(f"\n--- Fold rolling-origin (gap = {gap} ngày) ---")
+        for f in folds:
+            n_train = (f["train_end"] - f["train_start"]).days + 1
+            print(f"  fold {f['fold']}: train {n_train:>4} ngày tới "
+                  f"{f['train_end'].date()} | test {f['test_start'].date()} "
+                  f"-> {f['test_end'].date()}")
     return folds
 
 
-def assert_folds_ordered(folds: list[dict], cfg: Config) -> None:
+def build_fold_variants(df: pd.DataFrame, cfg: Config) -> dict[int, list[dict]]:
+    """Sinh nhiều bộ fold ứng với các giá trị gap khác nhau.
+
+    Giá trị gap chỉ ảnh hưởng ranh giới fold chứ không ảnh hưởng đặc trưng,
+    nên sinh tất cả biến thể trong cùng một lần chạy thay vì chạy lại toàn bộ
+    pipeline cho mỗi giá trị.
+    """
+    variants = cfg.split.get("gap_variants") or [cfg.split["gap_days"]]
+    out = {}
+    for gap in variants:
+        folds = rolling_origin_folds(df, cfg, gap_days=gap)
+        assert_folds_ordered(folds, cfg, gap_days=gap)
+        out[gap] = folds
+    return out
+
+
+def assert_folds_ordered(folds: list[dict], cfg: Config,
+                         gap_days: int | None = None) -> None:
     """Xác minh không fold nào có tập kiểm tra nằm trước tập huấn luyện."""
+    want = cfg.split["gap_days"] if gap_days is None else gap_days
     for f in folds:
         if f["train_end"] >= f["test_start"]:
             raise LeakageError(
@@ -181,9 +246,9 @@ def assert_folds_ordered(folds: list[dict], cfg: Config) -> None:
                 f"{f['test_start'].date()}"
             )
         gap = (f["test_start"] - f["train_end"]).days - 1
-        if gap < cfg.split["gap_days"]:
+        if gap < want:
             raise LeakageError(
                 f"Fold {f['fold']}: khoảng đệm {gap} ngày nhỏ hơn "
-                f"cấu hình {cfg.split['gap_days']}"
+                f"cấu hình {want}"
             )
-    print("  [đạt] mọi fold đúng thứ tự thời gian")
+    print(f"  [đạt] {len(folds)} fold đúng thứ tự, đệm >= {want} ngày")

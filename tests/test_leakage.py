@@ -44,7 +44,8 @@ def make_cfg(horizon: int = 7, lags=None, windows=None) -> Config:
                      "rolling_stats": ["mean"], "use_calendar": True,
                      "use_promotion": True, "use_holidays": False,
                      "use_static": False},
-        "split": {"n_folds": 3, "test_days": 28, "gap_days": 0},
+        "split": {"n_folds": 3, "test_days": 28, "gap_days": 0,
+                  "gap_variants": [0, 7]},
         "output": {"dir": "artifacts", "format": "parquet", "batch_size": 100},
     }
     return Config(raw=raw, raw_dir=Path("."), out_dir=Path("."),
@@ -228,6 +229,68 @@ class TestSplits:
         for a, b in zip(folds, folds[1:]):
             assert a["test_end"] < b["test_start"]
 
+    def test_gap_shrinks_training_window(self):
+        """Tăng gap phải làm tập huấn luyện kết thúc sớm hơn."""
+        cfg = make_cfg()
+        df = pd.DataFrame({"date": pd.date_range("2015-01-01", periods=400)})
+        f0 = rolling_origin_folds(df, cfg, gap_days=0, verbose=False)
+        f7 = rolling_origin_folds(df, cfg, gap_days=7, verbose=False)
+        for a, b in zip(f0, f7):
+            assert b["train_end"] < a["train_end"]
+            assert (a["train_end"] - b["train_end"]).days == 7
+            # cửa sổ kiểm tra phải giữ nguyên để hai biến thể so sánh được
+            assert a["test_start"] == b["test_start"]
+            assert a["test_end"] == b["test_end"]
+
+    def test_gap_variants_generated(self):
+        from src.checks import build_fold_variants
+        cfg = make_cfg()
+        cfg.split["gap_variants"] = [0, 7]
+        df = pd.DataFrame({"date": pd.date_range("2015-01-01", periods=400)})
+        out = build_fold_variants(df, cfg)
+        assert set(out) == {0, 7}
+        assert all(len(v) == cfg.split["n_folds"] for v in out.values())
+
+
+class TestBatchHomogeneity:
+    def test_uniform_batches_pass(self):
+        from src.checks import check_batch_homogeneity
+        stats = [{"batch": i, "n_rows": 1000, "n_series": 10,
+                  "zero_pct": 30.0 + i * 0.5} for i in range(5)]
+        out = check_batch_homogeneity(stats)
+        assert out.zero_pct.max() - out.zero_pct.min() <= 10
+
+    def test_skewed_batches_flagged(self, capsys):
+        """Lô lệch nhau nhiều phải sinh cảnh báo — đây chính là lỗi đã gặp."""
+        from src.checks import check_batch_homogeneity
+        stats = [{"batch": 0, "n_rows": 6165000, "n_series": 5000, "zero_pct": 22.2},
+                 {"batch": 4, "n_rows": 3134929, "n_series": 5000, "zero_pct": 42.0}]
+        check_batch_homogeneity(stats)
+        assert "CẢNH BÁO" in capsys.readouterr().out
+
+
+class TestShuffling:
+    def test_selection_is_shuffled_but_reproducible(self):
+        """Xáo trộn phải phá vỡ thứ tự gốc nhưng vẫn tái lập được với cùng seed."""
+        rng = np.random.default_rng(0)
+        n = 500
+        df = pd.DataFrame({
+            "store_nbr": 1,
+            "item_nbr": np.arange(n),
+            # first_date tăng dần: mô phỏng thứ tự tự nhiên của dữ liệu
+            "first_date": pd.date_range("2014-04-01", periods=n, freq="D"),
+        })
+        a = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+        b = df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+
+        pd.testing.assert_frame_equal(a, b)           # tái lập được
+        assert not a.item_nbr.is_monotonic_increasing  # đã phá vỡ thứ tự
+
+        # sau xáo trộn, các lô phải đồng nhất về first_date
+        means = [a.iloc[i:i + 100].first_date.mean() for i in range(0, n, 100)]
+        spread = (max(means) - min(means)).days
+        assert spread < 120, f"Các lô vẫn lệch {spread} ngày"
+
 
 # --------------------------------------------------------------------------- #
 # Phân loại mẫu nhu cầu
@@ -243,3 +306,66 @@ class TestPatternClassification:
         adi = pd.Series([np.nan])
         cv2 = pd.Series([0.5])
         assert classify_pattern(adi, cv2).iloc[0] == "Unclassified"
+
+
+# --------------------------------------------------------------------------- #
+# Chỉ số đánh giá
+# --------------------------------------------------------------------------- #
+class TestMetrics:
+    def test_wape_survives_all_zero_actuals(self):
+        """WAPE phải trả nan chứ không được ném lỗi chia cho không."""
+        from src.metrics import wape
+        assert np.isnan(wape(np.zeros(10), np.ones(10)))
+
+    def test_wape_perfect_forecast_is_zero(self):
+        from src.metrics import wape
+        y = np.array([0.0, 3, 0, 5, 0])
+        assert wape(y, y.copy()) == 0.0
+
+    def test_scale_factor_nan_on_constant_series(self):
+        """Chuỗi toàn 0 không có hệ số chuẩn hoá hợp lệ -> phải trả nan."""
+        from src.metrics import scale_factor
+        assert np.isnan(scale_factor(np.zeros(50)))
+
+    def test_rmsse_excludes_invalid_scale(self):
+        from src.metrics import rmsse
+        assert np.isnan(rmsse(np.array([1.0, 2]), np.array([1.0, 2]), np.nan))
+
+    def test_evaluate_reports_positive_days_separately(self):
+        """Phải tách riêng ngày có nhu cầu, nếu không mô hình dự báo toàn 0
+        sẽ trông tốt giả tạo."""
+        from src.metrics import evaluate_forecast
+        df = pd.DataFrame({
+            "store_nbr": 1, "item_nbr": 1,
+            "y": [0.0, 0, 0, 10, 0, 8],
+            "yhat": [0.0, 0, 0, 0, 0, 0],       # luôn dự báo 0
+        })
+        res = evaluate_forecast(df)
+        assert res["mae"] < res["mae_positive"]   # chỉ số tổng che giấu sai số
+        assert res["n_positive"] == 2
+
+
+class TestBaselines:
+    def test_croston_recovers_known_rate(self):
+        from src.models import croston
+        y = np.zeros(40)
+        y[3::4] = 8.0                    # 8 đơn vị mỗi 4 ngày -> 2.0
+        assert abs(croston(y, 0.1, "classic") - 2.0) < 1e-6
+
+    def test_sba_applies_bias_correction(self):
+        from src.models import croston
+        y = np.zeros(40)
+        y[3::4] = 8.0
+        ratio = croston(y, 0.1, "sba") / croston(y, 0.1, "classic")
+        assert abs(ratio - (1 - 0.1 / 2)) < 1e-9
+
+    def test_all_zero_series_returns_zero(self):
+        from src.models import croston
+        assert croston(np.zeros(30), 0.1, "classic") == 0.0
+
+    def test_tsb_decays_for_discontinued_item(self):
+        """TSB phải hạ dự báo khi mã hàng ngừng bán; Croston thì không."""
+        from src.models import croston
+        y = np.zeros(60)
+        y[:20:2] = 5.0                   # chỉ bán trong 20 ngày đầu
+        assert croston(y, 0.1, "tsb") < croston(y, 0.1, "classic")
