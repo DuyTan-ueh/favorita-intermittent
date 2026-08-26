@@ -18,8 +18,11 @@ pip install -r requirements.txt
 ```
 
 Dữ liệu: tải từ [Kaggle](https://www.kaggle.com/competitions/favorita-grocery-sales-forecasting)
-(cần Join Competition + Accept Rules), giải nén vào `data/raw/`.
-Trên Kaggle Notebook, pipeline tự dò đường dẫn.
+(cần Join Competition + Accept Rules), đặt vào `data/raw/`.
+
+Pipeline tự dò đường dẫn và **tự giải nén** nếu chỉ có bản nén `.7z` — trường
+hợp mặc định khi vừa gắn dữ liệu cuộc thi vào một phiên Kaggle mới. Không cần
+chạy bước giải nén thủ công.
 
 > **Giấy phép dữ liệu:** Kaggle Competition Rules — được dùng cho nghiên cứu
 > học thuật và phi thương mại, **không được phân phối lại dữ liệu gốc**.

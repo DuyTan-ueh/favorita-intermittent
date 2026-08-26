@@ -27,23 +27,87 @@ class ConfigError(ValueError):
 def find_raw_dir() -> Path:
     """Tìm thư mục chứa dữ liệu thô, hoạt động cả trên Kaggle lẫn máy cá nhân.
 
-    Kaggle đổi cấu trúc thư mục theo thời điểm tạo notebook, và dữ liệu có thể
-    ở dạng .csv hoặc .csv.7z, nên dò đệ quy thay vì giả định một đường dẫn.
+    Kaggle đổi cấu trúc thư mục theo thời điểm tạo notebook nên phải dò đệ quy
+    thay vì giả định một đường dẫn cố định.
+
+    Nếu chỉ tìm thấy bản nén ``.7z`` — trường hợp mặc định khi vừa gắn dữ liệu
+    cuộc thi vào một phiên làm việc mới — hàm sẽ tự giải nén sang thư mục ghi
+    được. Thư mục ``/kaggle/input`` chỉ cho đọc nên không thể giải nén tại chỗ,
+    và ``/kaggle/working`` bị xoá mỗi khi khởi động phiên mới, nên bước này cần
+    chạy lại ở mỗi phiên. Tự động hoá để không phải nhớ.
     """
-    candidates = [Path("/kaggle/working/favorita_extracted"),
-                  Path("/kaggle/input"),
-                  Path("data/raw")]
-    for base in candidates:
+    csv_names = ["train.csv", "items.csv", "stores.csv", "holidays_events.csv"]
+
+    search_roots = [Path("/kaggle/working/favorita_extracted"),
+                    Path("data/raw"),
+                    Path("/kaggle/input"),
+                    Path("/kaggle/working")]
+
+    # Ưu tiên tuyệt đối thư mục đã có train.csv giải nén sẵn
+    for base in search_roots:
         if not base.exists():
             continue
         for root, _dirs, files in os.walk(base):
-            if "train.csv" in files or "train.csv.7z" in files:
+            if "train.csv" in files:
                 return Path(root)
-    raise FileNotFoundError(
-        "Không tìm thấy train.csv. Trên Kaggle: Add Data cuộc thi "
-        "favorita-grocery-sales-forecasting và chạy bước giải nén trước. "
-        "Ở máy cá nhân: đặt dữ liệu vào data/raw/."
-    )
+
+    # Không thấy bản giải nén -> tìm bản nén để tự xử lý
+    archive_dir = None
+    for base in search_roots:
+        if not base.exists():
+            continue
+        for root, _dirs, files in os.walk(base):
+            if "train.csv.7z" in files:
+                archive_dir = Path(root)
+                break
+        if archive_dir:
+            break
+
+    if archive_dir is None:
+        raise FileNotFoundError(
+            "Không tìm thấy train.csv hoặc train.csv.7z.\n"
+            "Trên Kaggle: Add Data cuộc thi favorita-grocery-sales-forecasting "
+            "(nhớ Join Competition và Accept Rules trước).\n"
+            "Ở máy cá nhân: đặt dữ liệu vào data/raw/."
+        )
+
+    return _extract_archives(archive_dir, csv_names)
+
+
+def _extract_archives(src: Path, names: list[str]) -> Path:
+    """Giải nén các tệp .7z cần dùng sang thư mục ghi được."""
+    import shutil
+
+    try:
+        import py7zr
+    except ImportError as exc:
+        raise ImportError(
+            "Cần thư viện py7zr để giải nén dữ liệu cuộc thi. "
+            "Chạy: pip install py7zr"
+        ) from exc
+
+    dest = (Path("/kaggle/working/favorita_extracted")
+            if Path("/kaggle/working").exists() else Path("data/raw"))
+    dest.mkdir(parents=True, exist_ok=True)
+
+    print(f"Giải nén dữ liệu: {src} -> {dest}")
+    for name in names:
+        target = dest / name
+        if target.exists():
+            print(f"  {name:<24} đã có")
+            continue
+        plain, packed = src / name, src / f"{name}.7z"
+        if plain.exists():
+            shutil.copy(plain, target)
+            print(f"  {name:<24} sao chép")
+        elif packed.exists():
+            with py7zr.SevenZipFile(packed, mode="r") as archive:
+                archive.extractall(path=dest)
+            print(f"  {name:<24} giải nén xong")
+        else:
+            raise FileNotFoundError(f"Không thấy {name} hoặc {name}.7z trong {src}")
+
+    return dest
 
 
 # --------------------------------------------------------------------------- #
