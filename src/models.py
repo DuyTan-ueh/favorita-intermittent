@@ -190,6 +190,8 @@ FEATURE_SETS = {
     "hist_calendar": ["lag", "rolling", "intermittency", "calendar"],
     "hist_cal_holiday": ["lag", "rolling", "intermittency", "calendar",
                          "holiday"],
+    "hist_cal_hol_promo": ["lag", "rolling", "intermittency", "calendar",
+                           "holiday", "promotion"],
     "full": ["lag", "rolling", "intermittency", "calendar", "holiday",
              "promotion", "static"],
 }
@@ -198,8 +200,17 @@ FEATURE_SETS = {
 def select_features(specs: pd.DataFrame, groups: list[str]) -> list[str]:
     """Chọn cột đặc trưng theo nhóm, phục vụ nghiên cứu loại trừ.
 
-    Bốn cấu hình trong ``FEATURE_SETS`` được thiết kế để cô lập đóng góp của
-    từng nhóm: chênh lệch giữa ``hist_cal_holiday`` và ``full`` chính là phần
-    đóng góp của đặc trưng khuyến mãi, tức câu trả lời định lượng cho RQ2.
+    Năm cấu hình được xếp chồng dần, mỗi bước thêm đúng MỘT nhóm đặc trưng.
+    Nhờ vậy chênh lệch giữa hai bước liền kề chính là đóng góp riêng của nhóm
+    vừa thêm vào:
+
+      historical -> hist_calendar          : đóng góp của đặc trưng lịch
+      hist_calendar -> hist_cal_holiday    : đóng góp của ngày lễ, sự kiện
+      hist_cal_holiday -> hist_cal_hol_promo : đóng góp của KHUYẾN MÃI
+      hist_cal_hol_promo -> full           : đóng góp của thuộc tính tĩnh
+
+    Bước áp chót là bước quan trọng nhất, vì nó trả lời trực tiếp RQ2. Nếu bỏ
+    bước này và nhảy thẳng từ ``hist_cal_holiday`` sang ``full``, đóng góp của
+    khuyến mãi sẽ bị lẫn với đóng góp của thuộc tính tĩnh và không tách được.
     """
     return specs[specs.group.isin(groups)]["feature"].tolist()

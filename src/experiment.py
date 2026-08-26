@@ -82,9 +82,20 @@ def prepare_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
 
 def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
-             specs: pd.DataFrame, cfg: Config,
-             run_baselines: bool = True) -> list[dict]:
-    """Huấn luyện và đánh giá toàn bộ mô hình trên một fold."""
+             specs: pd.DataFrame, cfg: Config, series: pd.DataFrame,
+             run_baselines: bool = True) -> tuple[list[dict], list[pd.DataFrame]]:
+    """Huấn luyện và đánh giá toàn bộ mô hình trên một fold.
+
+    Trả về hai thứ tách bạch: bảng chỉ số tổng hợp, và bảng chỉ số phân tầng
+    theo nhóm mẫu nhu cầu. Bảng thứ hai được lập cho CẢ Single-Stage lẫn
+    Two-Stage, vì RQ3 hỏi khung hai giai đoạn có tốt hơn ở nhóm nào — muốn
+    trả lời thì phải so hai mô hình trong cùng một nhóm, chứ một mình con số
+    của Two-Stage không nói lên điều gì.
+    """
+    exp = cfg.raw.get("experiment", {})
+    n_est = exp.get("n_estimators", 300)
+    wanted_sets = exp.get("feature_sets") or list(models.FEATURE_SETS)
+
     train = df[df.date <= fold["train_end"]]
     test = df[(df.date >= fold["test_start"]) & (df.date <= fold["test_end"])]
 
@@ -92,7 +103,7 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
           f"(tới {fold['train_end'].date()}) | test {len(test):,} dòng")
 
     scales = metrics.compute_scales(train)
-    results = []
+    results, strat_frames = [], []
 
     # ---- Baseline cổ điển (RQ1) ----
     if run_baselines:
@@ -105,11 +116,22 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
                         "fold": fold["fold"], "gap": fold["gap_days"],
                         "seconds": round(time.time() - t0, 1)})
             results.append(res)
-            print(f"    {label:<22} WAPE {res['wape']:.4f} | "
+
+            # baseline cũng cần phân tầng để làm mốc so sánh trong RQ3
+            s = metrics.evaluate_by_pattern(pred, series)
+            s = s.assign(model=label, feature_set="-",
+                         fold=fold["fold"], gap=fold["gap_days"])
+            strat_frames.append(s)
+
+            print(f"    {label:<26} WAPE {res['wape']:.4f} | "
                   f"{res['seconds']:.0f}s")
 
     # ---- Một giai đoạn và Two-Stage, cho từng bộ đặc trưng (RQ1 + RQ2) ----
-    for set_name, groups in models.FEATURE_SETS.items():
+    for set_name in wanted_sets:
+        groups = models.FEATURE_SETS.get(set_name)
+        if groups is None:
+            print(f"    [bỏ qua] không có bộ đặc trưng '{set_name}'")
+            continue
         cols = [c for c in models.select_features(specs, groups)
                 if c in feature_cols]
         if not cols:
@@ -118,7 +140,8 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
         for label, fn in [("Single-Stage", models.fit_single_stage),
                           ("Two-Stage", models.fit_two_stage)]:
             t0 = time.time()
-            pred, _ = fn(train, test, cols, seed=cfg.seed)
+            pred, _ = fn(train, test, cols, seed=cfg.seed,
+                         n_estimators=n_est)
             res = metrics.evaluate_forecast(pred, scales)
 
             if label == "Two-Stage":
@@ -131,15 +154,18 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
                         "n_features": len(cols),
                         "seconds": round(time.time() - t0, 1)})
             results.append(res)
-            print(f"    {label + ' [' + set_name + ']':<22} "
+
+            s = metrics.evaluate_by_pattern(pred, series)
+            s = s.assign(model=label, feature_set=set_name,
+                         fold=fold["fold"], gap=fold["gap_days"])
+            strat_frames.append(s)
+
+            print(f"    {label + ' [' + set_name + ']':<26} "
                   f"WAPE {res['wape']:.4f} | {res['seconds']:.0f}s")
+            del pred
+            gc.collect()
 
-            # Phân tầng theo nhóm nhu cầu cho cấu hình đầy đủ (RQ3)
-            if set_name == "full":
-                res["_stratified"] = pred
-        gc.collect()
-
-    return results
+    return results, strat_frames
 
 
 def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
@@ -150,40 +176,63 @@ def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
     series = pd.read_parquet(cfg.out_dir / "series_selected.parquet")
     folds = load_folds(cfg, gap)
 
-    df = load_features(cfg, max_parts)
-    df, feature_cols = prepare_matrix(df)
+    out_dir = cfg.out_dir / f"results_gap{gap}"
+    out_dir.mkdir(exist_ok=True)
+    ckpt_dir = out_dir / "checkpoints"
+    use_ckpt = cfg.raw.get("experiment", {}).get("checkpoint", True)
+    if use_ckpt:
+        ckpt_dir.mkdir(exist_ok=True)
 
     if quick:
         folds = folds[-1:]
         print("  [chế độ nhanh] chỉ chạy fold cuối")
 
-    all_results, strat_frames = [], []
-    for fold in folds:
-        res = run_fold(df, fold, feature_cols, specs, cfg)
-        for r in res:
-            pred = r.pop("_stratified", None)
-            if pred is not None and r["model"] == "Two-Stage":
-                s = metrics.evaluate_by_pattern(pred, series)
-                s["fold"] = fold["fold"]
-                s["gap"] = gap
-                strat_frames.append(s)
-        all_results.extend(res)
+    # Bỏ qua những fold đã hoàn tất ở lần chạy trước. Việc này quan trọng vì
+    # một lượt chạy đầy đủ mất nhiều giờ và phiên làm việc có thể bị ngắt.
+    todo = []
+    for f in folds:
+        done = ckpt_dir / f"fold{f['fold']}_metrics.csv"
+        if use_ckpt and done.exists():
+            print(f"  [bỏ qua] fold {f['fold']} đã có kết quả từ lần chạy trước")
+        else:
+            todo.append(f)
+
+    if todo:
+        df = load_features(cfg, max_parts)
+        df, feature_cols = prepare_matrix(df)
+    else:
+        print("  Mọi fold đã hoàn tất, chỉ tổng hợp lại kết quả")
+
+    for fold in todo:
+        res, strat = run_fold(df, fold, feature_cols, specs, cfg, series)
+        if use_ckpt:
+            pd.DataFrame(res).to_csv(
+                ckpt_dir / f"fold{fold['fold']}_metrics.csv", index=False)
+            pd.concat(strat, ignore_index=True).to_csv(
+                ckpt_dir / f"fold{fold['fold']}_pattern.csv", index=False)
+            print(f"  [đã lưu] checkpoint fold {fold['fold']}")
         gc.collect()
 
-    results = pd.DataFrame(all_results)
-    out_dir = cfg.out_dir / f"results_gap{gap}"
-    out_dir.mkdir(exist_ok=True)
-    results.to_csv(out_dir / "metrics_by_fold.csv", index=False)
+    # Gộp toàn bộ checkpoint lại, kể cả của những lần chạy trước
+    metric_files = sorted(ckpt_dir.glob("fold*_metrics.csv")) if use_ckpt else []
+    pattern_files = sorted(ckpt_dir.glob("fold*_pattern.csv")) if use_ckpt else []
+    if not metric_files:
+        raise RuntimeError("Không có kết quả nào để tổng hợp")
 
-    if strat_frames:
-        strat = pd.concat(strat_frames, ignore_index=True)
+    results = pd.concat([pd.read_csv(f) for f in metric_files],
+                        ignore_index=True)
+    strat = (pd.concat([pd.read_csv(f) for f in pattern_files],
+                       ignore_index=True) if pattern_files else None)
+
+    results.to_csv(out_dir / "metrics_by_fold.csv", index=False)
+    if strat is not None:
         strat.to_csv(out_dir / "metrics_by_pattern.csv", index=False)
 
-    _summarise(results, strat_frames, out_dir, gap)
+    _summarise(results, strat, out_dir, gap)
     return results
 
 
-def _summarise(results: pd.DataFrame, strat_frames: list,
+def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
                out_dir: Path, gap: int) -> None:
     """In các bảng tổng hợp tương ứng từng câu hỏi nghiên cứu."""
     agg = (results.groupby(["model", "feature_set"], as_index=False)
@@ -196,31 +245,68 @@ def _summarise(results: pd.DataFrame, strat_frames: list,
     _banner(f"RQ1 — SO SÁNH MÔ HÌNH (gap={gap}, trung bình các fold)")
     print(agg.round(4).to_string(index=False))
 
-    two = results[results.model == "Two-Stage"]
-    if len(two):
-        _banner(f"RQ2 — ĐÓNG GÓP CỦA TỪNG NHÓM ĐẶC TRƯNG (gap={gap})")
-        ab = (two.groupby("feature_set", as_index=False)
+    # ---------------- RQ2 ----------------
+    _banner(f"RQ2 — ĐÓNG GÓP CỦA TỪNG NHÓM ĐẶC TRƯNG (gap={gap})")
+    order = [s for s in models.FEATURE_SETS
+             if s in set(results.feature_set)]
+
+    for model_name in ["Single-Stage", "Two-Stage"]:
+        sub = results[results.model == model_name]
+        if not len(sub):
+            continue
+        ab = (sub.groupby("feature_set", as_index=False)
               .agg(wape=("wape", "mean"), rmse=("rmse", "mean")))
-        order = list(models.FEATURE_SETS)
         ab["_o"] = ab.feature_set.map({k: i for i, k in enumerate(order)})
-        ab = ab.sort_values("_o").drop(columns="_o")
+        ab = ab.sort_values("_o").drop(columns="_o").reset_index(drop=True)
+
         base = ab.wape.iloc[0]
-        ab["cải_thiện_%"] = ((base - ab.wape) / base * 100).round(2)
+        ab["tích_luỹ_%"] = ((base - ab.wape) / base * 100).round(2)
+        # Đóng góp RIÊNG của nhóm vừa thêm vào ở mỗi bước
+        ab["riêng_%"] = ab["tích_luỹ_%"].diff().fillna(0).round(2)
+
+        print(f"\n[{model_name}]")
         print(ab.round(4).to_string(index=False))
 
-        occ = two.dropna(subset=["pr_auc"])
-        if len(occ):
-            print("\n  Giai đoạn 1 — nhận biết ngày có đơn:")
-            print(occ.groupby("feature_set")[
-                ["precision", "recall", "f1", "pr_auc"]]
-                .mean().round(4).to_string())
+    print("\n  Đọc bảng: mỗi dòng thêm đúng một nhóm đặc trưng so với dòng "
+          "trên,\n  nên cột 'riêng_%' là đóng góp của riêng nhóm đó.")
+    print("  Dòng 'hist_cal_hol_promo' cô lập đóng góp của KHUYẾN MÃI.")
 
-    if strat_frames:
-        _banner(f"RQ3 — HIỆU QUẢ THEO NHÓM MẪU NHU CẦU (gap={gap})")
-        strat = pd.concat(strat_frames, ignore_index=True)
-        print(strat.groupby("pattern")[
-            ["n_series", "zero_rate", "wape", "mae", "rmse"]]
+    occ = results[(results.model == "Two-Stage")].dropna(subset=["pr_auc"])
+    if len(occ):
+        print("\n  Giai đoạn 1 — nhận biết ngày có đơn:")
+        print(occ.groupby("feature_set")[
+            ["precision", "recall", "f1", "pr_auc"]]
             .mean().round(4).to_string())
+
+    # ---------------- RQ3 ----------------
+    if strat is None or not len(strat):
+        return
+
+    _banner(f"RQ3 — HIỆU QUẢ THEO NHÓM MẪU NHU CẦU (gap={gap})")
+    full = strat[strat.feature_set.isin(["full", "-"])]
+
+    pivot = (full.pivot_table(index="pattern", columns="model",
+                              values="wape", aggfunc="mean").round(4))
+    cols = [c for c in ["Croston", "SBA", "TSB",
+                        "Single-Stage", "Two-Stage"] if c in pivot.columns]
+    pivot = pivot[cols]
+
+    if {"Single-Stage", "Two-Stage"}.issubset(pivot.columns):
+        # Số âm nghĩa là Two-Stage tốt hơn (WAPE thấp hơn)
+        pivot["Two−Single"] = (pivot["Two-Stage"]
+                               - pivot["Single-Stage"]).round(4)
+        pivot["Two thắng?"] = np.where(pivot["Two−Single"] < 0, "có", "không")
+
+    info = (full[full.model == "Two-Stage"]
+            .groupby("pattern")[["n_series", "zero_rate"]].mean().round(4))
+    out = info.join(pivot)
+    order_p = ["Smooth", "Erratic", "Intermittent", "Lumpy"]
+    out = out.reindex([p for p in order_p if p in out.index])
+
+    print(out.to_string())
+    print("\n  Cột 'Two−Single' âm nghĩa là khung hai giai đoạn tốt hơn ở "
+          "nhóm đó.\n  Đây chính là câu trả lời cho RQ3.")
+    out.to_csv(out_dir / "rq3_model_by_pattern.csv")
 
     print(f"\nKết quả lưu tại: {out_dir}")
 

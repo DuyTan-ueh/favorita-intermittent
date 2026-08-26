@@ -45,6 +45,26 @@ split:
   # luyện một lần rồi dự báo cả chu kỳ mà không cập nhật.
   gap_variants: [0, 7]
 
+experiment:
+  # Số cây của XGBoost. Giảm xuống rút ngắn thời gian chạy đáng kể mà vẫn giữ
+  # được tính công bằng khi so sánh, vì mọi mô hình đều dùng cùng một giá trị.
+  # 300 cho kết quả tốt nhất nhưng cả hai giá trị gap mất khoảng 15 giờ, vượt
+  # giới hạn phiên làm việc của Kaggle. 200 là mức cân bằng hợp lý.
+  n_estimators: 200
+
+  # Bộ đặc trưng đưa vào nghiên cứu loại trừ, xếp chồng dần từng nhóm một.
+  # Bỏ bớt phần tử ở đây để rút ngắn thời gian nếu cần.
+  feature_sets:
+    - historical
+    - hist_calendar
+    - hist_cal_holiday
+    - hist_cal_hol_promo
+    - full
+
+  # Ghi kết quả sau mỗi fold. Nếu phiên làm việc bị ngắt giữa chừng, lần chạy
+  # sau sẽ bỏ qua những fold đã xong thay vì làm lại từ đầu.
+  checkpoint: true
+
 output:
   dir: "artifacts"
   format: "parquet"

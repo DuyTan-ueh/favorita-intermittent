@@ -224,4 +224,4 @@ def evaluate_by_pattern(df: pd.DataFrame, series_meta: pd.DataFrame,
     out = pd.DataFrame(rows)
     if "rmsse" in out.columns:
         cols.append("rmsse")
-    return out[[c for c in cols if c in out.columns]]
+    return out[[c for c in cols if c in out.columns]].copy()

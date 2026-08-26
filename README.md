@@ -37,8 +37,9 @@ python -m src.pipeline --config config/default.yaml
 # 3. Chạy thực nghiệm — thử nhanh trên fold cuối trước
 python -m src.experiment --gap 0 --quick
 
-# 4. Chạy đầy đủ cả hai biến thể gap
-python -m src.experiment
+# 4. Chạy đầy đủ — CHẠY TÁCH TỪNG GAP, mỗi lần một phiên
+python -m src.experiment --gap 0
+python -m src.experiment --gap 7
 
 # Kiểm thử
 pytest tests/ -v
@@ -50,6 +51,19 @@ với `--config`. Không sửa tham số trực tiếp trong code.
 Nếu thiếu bộ nhớ ở bước thực nghiệm, dùng `--max-parts 3` để chỉ nạp một
 phần các tệp lô. Cách này an toàn vì chuỗi đã được xáo trộn trước khi chia lô,
 nên mỗi tệp là một mẫu đại diện.
+
+### Thời gian chạy và checkpoint
+
+Trên Kaggle, một giá trị gap với 3 fold và 5 bộ đặc trưng mất khoảng 5–8 giờ
+tuỳ cấu hình máy được cấp. Chạy cả hai gap trong một phiên sẽ vượt giới hạn
+12 giờ, nên **chạy tách từng gap**.
+
+Kết quả được ghi lại sau mỗi fold. Nếu phiên bị ngắt giữa chừng, chạy lại
+cùng lệnh sẽ bỏ qua các fold đã xong thay vì làm lại từ đầu. Muốn chạy lại
+sạch, xoá thư mục `artifacts/<run>/results_gap*/checkpoints/`.
+
+Giảm thời gian bằng cách hạ `experiment.n_estimators` hoặc bớt phần tử trong
+`experiment.feature_sets`.
 
 ## Cấu trúc
 
