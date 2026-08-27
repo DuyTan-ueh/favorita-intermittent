@@ -141,6 +141,30 @@ def paired_test_by_series(losses: pd.DataFrame, model_a: str, model_b: str,
     mean_diff = float(np.mean(diff))
     win_rate = float(np.mean(diff > 0))    # tỷ lệ chuỗi mà B tốt hơn
 
+    # Với hơn hai mươi nghìn chuỗi, lực kiểm định cao tới mức gần như mọi
+    # chênh lệch đều đạt ý nghĩa thống kê. Giá trị p khi đó không còn phân biệt
+    # được đâu là khác biệt đáng kể trong thực tế, nên phải báo cáo kèm độ lớn
+    # hiệu ứng. Quy ước thông dụng: 0,2 là nhỏ, 0,5 là vừa, 0,8 là lớn.
+    sd = float(np.std(diff, ddof=1))
+    if sd > 1e-12:
+        cohen_d = mean_diff / sd
+    elif abs(mean_diff) < 1e-12:
+        cohen_d = 0.0          # hai mô hình trùng khớp hoàn toàn
+    else:
+        # Chênh lệch không đổi trên mọi chuỗi: hiệu ứng nhất quán tuyệt đối,
+        # về mặt toán học là vô hạn. Trả về 0 ở đây sẽ nói ngược hoàn toàn ý
+        # nghĩa, nên dùng vô cùng có dấu.
+        cohen_d = float(np.inf) * np.sign(mean_diff)
+
+    if abs(cohen_d) < 0.2:
+        magnitude = "không đáng kể"
+    elif abs(cohen_d) < 0.5:
+        magnitude = "nhỏ"
+    elif abs(cohen_d) < 0.8:
+        magnitude = "vừa"
+    else:
+        magnitude = "lớn"
+
     if min(p_t, p_w) >= 0.05:
         verdict = "không khác biệt"
     else:
@@ -155,6 +179,8 @@ def paired_test_by_series(losses: pd.DataFrame, model_a: str, model_b: str,
         "t_stat": float(t_stat),
         "p_ttest": float(p_t),
         "p_wilcoxon": float(p_w),
+        "cohen_d": float(cohen_d),
+        "độ_lớn": magnitude,
         "verdict": verdict,
     }
 

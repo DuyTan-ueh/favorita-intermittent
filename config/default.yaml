@@ -49,8 +49,8 @@ experiment:
   # Số cây của XGBoost. Giảm xuống rút ngắn thời gian chạy đáng kể mà vẫn giữ
   # được tính công bằng khi so sánh, vì mọi mô hình đều dùng cùng một giá trị.
   # 300 cho kết quả tốt nhất nhưng cả hai giá trị gap mất khoảng 15 giờ, vượt
-  # giới hạn phiên làm việc của Kaggle. 200 là mức cân bằng hợp lý.
-  n_estimators: 200
+  # giới hạn phiên. Với GPU, thời gian giảm khoảng 8 lần nên 300 chạy thoải mái.
+  n_estimators: 300
 
   # Thiết bị tính toán: "auto" tự dò GPU và lùi về CPU nếu không có.
   # GPU rút ngắn thời gian huấn luyện rất nhiều với dữ liệu quy mô này.
@@ -66,6 +66,15 @@ experiment:
   #   absolute     - khớp với WAPE vốn dựa trên sai số tuyệt đối
   #   log_squared  - biến đổi log rồi dùng sai số bình phương
   stage2_objectives: [squared, gamma, absolute]
+
+  # Hàm mất mát cho mô hình MỘT giai đoạn. Phải thử song song với giai đoạn
+  # hai, nếu không sẽ không tách được ảnh hưởng của kiến trúc khỏi ảnh hưởng
+  # của hàm mất mát.
+  #   tweedie   - mặc định, có khối xác suất tại không
+  #   absolute  - khớp WAPE, NHƯNG dễ suy biến về dự báo toàn số không trên
+  #               chuỗi có quá nửa số ngày không bán
+  #   squared   - mốc so sánh
+  single_stage_objectives: [tweedie, absolute, squared]
 
   # Mô hình hoá phần dư y-1 thay vì y, vì nhu cầu dương nhỏ nhất là 1.
   stage2_shift: false

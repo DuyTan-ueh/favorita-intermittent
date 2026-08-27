@@ -114,20 +114,33 @@ def resolve_device(requested: str = "auto") -> str:
     ``device="cuda"`` cùng với ``tree_method="hist"``.
     """
     if requested == "cpu":
+        print("  Thiết bị: CPU (theo cấu hình)")
         return "cpu"
 
+    gpu_name = None
     try:
         import subprocess
-        subprocess.run(["nvidia-smi"], capture_output=True, check=True,
-                       timeout=10)
-        has_gpu = True
+        out = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name,memory.total",
+             "--format=csv,noheader"],
+            capture_output=True, check=True, timeout=10, text=True)
+        gpu_name = out.stdout.strip().splitlines()[0]
     except Exception:
-        has_gpu = False
+        pass
 
-    if requested == "cuda" and not has_gpu:
-        print("  [cảnh báo] yêu cầu GPU nhưng không phát hiện được, dùng CPU")
+    if gpu_name is None:
+        if requested == "cuda":
+            print("  [cảnh báo] yêu cầu GPU nhưng không phát hiện được, "
+                  "chuyển sang CPU")
+        else:
+            print("  Thiết bị: CPU (không phát hiện GPU)")
         return "cpu"
-    return "cuda" if has_gpu else "cpu"
+
+    print(f"  Thiết bị: GPU — {gpu_name}")
+    print("  Lưu ý: Croston/SBA/TSB là thuật toán làm trơn thuần tuý, "
+          "không dùng GPU.\n"
+          "  Chỉ Single-Stage và Two-Stage được tăng tốc.")
+    return "cuda"
 
 
 def _xgb_params(objective: str, seed: int, device: str = "cpu") -> dict:
@@ -228,24 +241,69 @@ def _predict_stage2(model, X: pd.DataFrame, spec: dict,
     return np.clip(pred, 0, None)
 
 
+# --------------------------------------------------------------------------- #
+# Hàm mất mát cho mô hình một giai đoạn
+# --------------------------------------------------------------------------- #
+# Mô hình một giai đoạn học trực tiếp trên toàn bộ dữ liệu, bao gồm cả những
+# ngày nhu cầu bằng không. Điều này tạo ra một rủi ro mà mô hình hai giai đoạn
+# không gặp phải.
+#
+# Sai số tuyệt đối được tối thiểu hoá tại TRUNG VỊ có điều kiện, không phải kỳ
+# vọng. Trên một chuỗi mà quá nửa số ngày không phát sinh nhu cầu, trung vị
+# bằng đúng không — nên mô hình tối ưu theo sai số tuyệt đối sẽ dự báo bằng
+# không cho toàn bộ chuỗi đó. Chỉ số MAE và WAPE khi ấy trông rất đẹp, nhưng
+# dự báo hoàn toàn vô dụng cho việc lập kế hoạch tồn kho.
+#
+# Rủi ro này không phải giả định lý thuyết suông: trong dữ liệu Favorita, nhóm
+# Intermittent có 53% ngày không bán và nhóm Lumpy có 46%, tức nằm ngay tại
+# hoặc vượt ngưỡng nguy hiểm.
+#
+# Mô hình hai giai đoạn miễn nhiễm với vấn đề này, vì giai đoạn hai chỉ học
+# trên các quan sát dương — trung vị của phân phối đã bỏ số không nên không
+# thể bằng không. Đây có thể chính là cơ chế giải thích ưu thế của khung hai
+# giai đoạn, và là lý do phải đưa cả hai vào so sánh mới kết luận được.
+
+SINGLE_STAGE_OBJECTIVES = {
+    "tweedie": {"objective": "reg:tweedie", "extra": {
+        "tweedie_variance_power": 1.3}},
+    "squared": {"objective": "reg:squarederror", "extra": {}},
+    "absolute": {"objective": "reg:absoluteerror", "extra": {}},
+    "poisson": {"objective": "count:poisson", "extra": {}},
+}
+
+
 def fit_single_stage(train: pd.DataFrame, test: pd.DataFrame,
                      feature_cols: list[str], seed: int = 42,
                      n_estimators: int = 300, device: str = "cpu",
-                     **_) -> tuple:
+                     objective: str = "tweedie", **_) -> tuple:
     """Hồi quy trực tiếp số lượng, không tách bài toán.
 
-    Dùng hàm mất mát Tweedie thay vì bình phương sai số: phân phối Tweedie có
-    khối xác suất tại không cộng với phần liên tục dương, đúng dạng dữ liệu
-    nhu cầu gián đoạn. Dùng bình phương sai số ở đây sẽ tạo mốc so sánh yếu
-    một cách không cần thiết.
+    Mặc định dùng Tweedie: phân phối này có khối xác suất tại không cộng với
+    phần liên tục dương, đúng dạng dữ liệu nhu cầu gián đoạn, nên tạo mốc so
+    sánh công bằng hơn nhiều so với bình phương sai số thuần.
+
+    Tham số ``objective`` cho phép đổi hàm mất mát. Việc này cần thiết để so
+    sánh công bằng với khung hai giai đoạn: nếu chỉ khung hai giai đoạn được
+    dùng sai số tuyệt đối trong khi mô hình một giai đoạn dùng Tweedie, phần
+    chênh lệch quan sát được sẽ lẫn giữa ảnh hưởng của kiến trúc và ảnh hưởng
+    của hàm mất mát.
     """
     import xgboost as xgb
 
-    params = _xgb_params("reg:tweedie", seed, device)
-    params["tweedie_variance_power"] = 1.3
+    spec = SINGLE_STAGE_OBJECTIVES.get(objective)
+    if spec is None:
+        raise ValueError(f"objective không hợp lệ: {objective}. "
+                         f"Chọn một trong {list(SINGLE_STAGE_OBJECTIVES)}")
+
+    params = _xgb_params(spec["objective"], seed, device)
+    params.update(spec["extra"])
+
+    y = train["y"]
+    if spec["objective"] in ("reg:gamma", "count:poisson"):
+        y = y.clip(lower=1e-6)
 
     model = xgb.XGBRegressor(n_estimators=n_estimators, **params)
-    model.fit(train[feature_cols], train["y"], verbose=False)
+    model.fit(train[feature_cols], y, verbose=False)
 
     out = test[KEYS + ["date", "y"]].copy()
     out["yhat"] = np.clip(model.predict(test[feature_cols]), 0, None)

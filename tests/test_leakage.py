@@ -466,3 +466,172 @@ class TestStage2Objectives:
     def test_device_auto_returns_valid_value(self):
         from src.models import resolve_device
         assert resolve_device("auto") in ("cpu", "cuda")
+
+
+# --------------------------------------------------------------------------- #
+# Chẩn đoán độ chệch — phát hiện mô hình suy biến
+# --------------------------------------------------------------------------- #
+class TestBiasDiagnostics:
+    def test_bias_ratio_detects_underforecast(self):
+        from src.metrics import bias_ratio
+        y = np.array([10.0, 20.0, 30.0])
+        assert bias_ratio(y, y * 0.5) == pytest.approx(0.5)
+        assert bias_ratio(y, y) == pytest.approx(1.0)
+
+    def test_bias_ratio_nan_when_no_demand(self):
+        from src.metrics import bias_ratio
+        assert np.isnan(bias_ratio(np.zeros(5), np.ones(5)))
+
+    def test_near_zero_rate_flags_degenerate_model(self):
+        """Mô hình dự báo toàn số không phải bị phát hiện."""
+        from src.metrics import near_zero_rate
+        assert near_zero_rate(np.zeros(100)) == 1.0
+        assert near_zero_rate(np.full(100, 5.0)) == 0.0
+
+    def test_degenerate_model_has_good_mae_but_bad_bias(self):
+        """Đây là bệnh lý cốt lõi: sai số nhỏ nhưng dự báo vô dụng.
+
+        Trên chuỗi có quá nửa số ngày bằng không, mô hình dự báo toàn số không
+        đạt MAE tốt hơn mô hình dự báo đúng kỳ vọng — nhưng hoàn toàn không
+        dùng được. Chỉ chỉ số độ chệch mới phơi bày điều này.
+        """
+        from src.metrics import evaluate_forecast
+        rng = np.random.default_rng(0)
+        n = 5000
+        y = np.where(rng.random(n) < 0.65, 0.0, rng.poisson(5, n) + 1.0)
+
+        df_zero = pd.DataFrame({"store_nbr": 1, "item_nbr": 1,
+                                "y": y, "yhat": np.zeros(n)})
+        df_mean = pd.DataFrame({"store_nbr": 1, "item_nbr": 1,
+                                "y": y, "yhat": np.full(n, y.mean())})
+
+        r0, rm = evaluate_forecast(df_zero), evaluate_forecast(df_mean)
+        assert r0["mae"] < rm["mae"]            # dự báo 0 có MAE tốt hơn
+        assert r0["bias_ratio"] == 0.0          # nhưng chệch hoàn toàn
+        assert rm["bias_ratio"] == pytest.approx(1.0, abs=0.01)
+        assert r0["near_zero_rate"] == 1.0
+
+
+class TestFactorialDesign:
+    def test_single_stage_objectives_available(self):
+        from src.models import SINGLE_STAGE_OBJECTIVES
+        assert set(SINGLE_STAGE_OBJECTIVES) >= {"tweedie", "absolute",
+                                                "squared"}
+
+    def test_invalid_objective_rejected(self):
+        from src.models import fit_single_stage
+        df = pd.DataFrame({"store_nbr": [1], "item_nbr": [1],
+                           "date": [pd.Timestamp("2015-01-01")],
+                           "y": [1.0], "f": [0.5]})
+        with pytest.raises(ValueError, match="objective không hợp lệ"):
+            fit_single_stage(df, df, ["f"], objective="không_tồn_tại")
+
+    def test_invalid_stage2_rejected(self):
+        from src.models import fit_two_stage
+        df = pd.DataFrame({"store_nbr": [1], "item_nbr": [1],
+                           "date": [pd.Timestamp("2015-01-01")],
+                           "y": [1.0], "y_occurrence": [1], "f": [0.5]})
+        with pytest.raises(ValueError, match="stage2 không hợp lệ"):
+            fit_two_stage(df, df, ["f"], stage2="không_tồn_tại")
+
+
+class TestEffectSize:
+    def test_cohen_d_reported(self):
+        """Chênh lệch lớn và ổn định phải cho độ lớn hiệu ứng 'lớn'."""
+        from src.significance import paired_test_by_series
+        rng = np.random.default_rng(5)
+        n = 500
+        base = rng.gamma(2, 1, n)
+        # chênh lệch có dao động, giống thực tế hơn chênh lệch hằng số
+        gap = 2.0 + rng.normal(0, 0.5, n)
+        df = pd.concat([
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "A", "mae": base + gap}),
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "B", "mae": base}),
+        ])
+        res = paired_test_by_series(df, "A", "B")
+        assert res["cohen_d"] > 0.8
+        assert res["độ_lớn"] == "lớn"
+
+    def test_constant_difference_is_infinite_effect(self):
+        """Chênh lệch hằng số nghĩa là hiệu ứng nhất quán tuyệt đối.
+
+        Trả về không ở đây sẽ nói ngược hoàn toàn ý nghĩa: độ lệch chuẩn bằng
+        không không phải vì không có khác biệt, mà vì khác biệt lặp lại y hệt
+        trên mọi chuỗi.
+        """
+        from src.significance import paired_test_by_series
+        n = 300
+        df = pd.concat([
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "A", "mae": np.full(n, 3.0)}),
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "B", "mae": np.full(n, 1.0)}),
+        ])
+        res = paired_test_by_series(df, "A", "B")
+        assert np.isinf(res["cohen_d"]) and res["cohen_d"] > 0
+        assert res["độ_lớn"] == "lớn"
+
+    def test_tiny_difference_flagged_as_negligible(self):
+        """Chênh lệch nhỏ trên mẫu lớn: p nhỏ nhưng độ lớn không đáng kể."""
+        from src.significance import paired_test_by_series
+        rng = np.random.default_rng(6)
+        n = 20000
+        base = rng.gamma(2, 1, n)
+        # chênh lệch rất nhỏ so với độ phân tán: đúng tình huống gặp phải
+        # trong thực nghiệm, nơi WAPE chỉ lệch vài phần nghìn
+        gap = 0.03 + rng.normal(0, 0.5, n)
+        df = pd.concat([
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "A", "mae": base + gap}),
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "B", "mae": base}),
+        ])
+        res = paired_test_by_series(df, "A", "B")
+        assert res["p_wilcoxon"] < 0.001          # đạt ý nghĩa thống kê
+        assert res["độ_lớn"] == "không đáng kể"   # nhưng không đáng kể
+
+
+class TestModuleIntegrity:
+    """Chặn lỗi đã gặp hai lần: định nghĩa hàm nằm sau điểm khởi chạy.
+
+    Python thực thi module từ trên xuống. Khối ``if __name__ == "__main__"``
+    gọi ``main()`` ngay tại chỗ, nên bất kỳ hàm nào được định nghĩa PHÍA SAU
+    khối đó sẽ chưa tồn tại khi chương trình chạy. Lỗi này không lộ ra lúc
+    nạp module mà chỉ vỡ giữa chừng, sau khi thực nghiệm đã chạy hàng chục
+    phút — nên đáng để kiểm tra tự động.
+
+    Lưu ý phân biệt: hàm gọi hàm khác nằm dưới nó là HỢP LỆ, vì tên chỉ được
+    phân giải lúc gọi chứ không phải lúc định nghĩa. Chỉ vị trí tương đối so
+    với điểm khởi chạy mới quan trọng.
+    """
+
+    @staticmethod
+    def _check(path):
+        import ast
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+
+        entry_line = None
+        for node in tree.body:
+            if isinstance(node, ast.If):
+                test = node.test
+                if (isinstance(test, ast.Compare)
+                        and isinstance(test.left, ast.Name)
+                        and test.left.id == "__name__"):
+                    entry_line = node.lineno
+        if entry_line is None:
+            return []
+
+        return [n.name for n in tree.body
+                if isinstance(n, (ast.FunctionDef, ast.ClassDef))
+                and n.lineno > entry_line]
+
+    def test_nothing_defined_after_entry_point(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1] / "src"
+        for mod in root.glob("*.py"):
+            late = self._check(mod)
+            assert not late, (
+                f"{mod.name}: {late} được định nghĩa sau khối "
+                f"if __name__ == '__main__', nên sẽ chưa tồn tại khi chạy")

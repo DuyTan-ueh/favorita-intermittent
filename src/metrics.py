@@ -52,6 +52,33 @@ EPS = 1e-9
 # --------------------------------------------------------------------------- #
 # Chỉ số cho dự báo cuối cùng
 # --------------------------------------------------------------------------- #
+def bias_ratio(y: np.ndarray, yhat: np.ndarray) -> float:
+    """Tỷ số giữa tổng dự báo và tổng nhu cầu thực.
+
+    Giá trị bằng 1 nghĩa là dự báo cân bằng trên tổng thể. Nhỏ hơn 1 là dự báo
+    thiếu một cách hệ thống, lớn hơn 1 là dự báo thừa.
+
+    Chỉ số này cần thiết vì các chỉ số sai số thông thường không phân biệt được
+    hai loại sai lệch. Một mô hình dự báo thiếu đều đặn có thể đạt MAE rất tốt
+    trên dữ liệu nhiều số không — chỉ cần đoán thấp — nhưng lại gây hết hàng
+    liên tục khi đưa vào vận hành. Với bài toán tồn kho, sai lệch hệ thống
+    nguy hiểm hơn nhiều so với sai số ngẫu nhiên cùng độ lớn.
+    """
+    total = float(np.sum(y))
+    return float(np.sum(yhat) / total) if total > EPS else np.nan
+
+
+def near_zero_rate(yhat: np.ndarray, threshold: float = 0.5) -> float:
+    """Tỷ lệ dự báo gần bằng không.
+
+    Dùng để phát hiện hiện tượng mô hình suy biến về dự báo toàn số không.
+    Hiện tượng này xảy ra khi huấn luyện bằng sai số tuyệt đối trên chuỗi có
+    quá nửa số ngày không phát sinh nhu cầu, vì khi đó trung vị có điều kiện —
+    đại lượng mà sai số tuyệt đối tối thiểu hoá — bằng đúng không.
+    """
+    return float(np.mean(yhat < threshold))
+
+
 def mae(y: np.ndarray, yhat: np.ndarray) -> float:
     return float(np.mean(np.abs(y - yhat)))
 
@@ -139,6 +166,12 @@ def evaluate_forecast(df: pd.DataFrame, scales: pd.DataFrame | None = None,
         "mae": mae(y, yhat),
         "rmse": rmse(y, yhat),
         "wape": wape(y, yhat),
+        # Hai chỉ số dưới không đo độ chính xác mà đo tính lành mạnh của dự
+        # báo. Một mô hình có sai số nhỏ nhưng dự báo thiếu hệ thống, hoặc dự
+        # báo bằng không cho phần lớn quan sát, không dùng được trong vận hành
+        # dù bảng chỉ số trông đẹp.
+        "bias_ratio": bias_ratio(y, yhat),
+        "near_zero_rate": near_zero_rate(yhat),
     }
 
     pos = y > 0
@@ -220,7 +253,8 @@ def evaluate_by_pattern(df: pd.DataFrame, series_meta: pd.DataFrame,
         rows.append(res)
 
     cols = ["pattern", "n_series", "n_obs", "zero_rate", "mae", "rmse",
-            "wape", "mae_positive", "rmse_positive"]
+            "wape", "bias_ratio", "near_zero_rate",
+            "mae_positive", "rmse_positive"]
     out = pd.DataFrame(rows)
     if "rmsse" in out.columns:
         cols.append("rmsse")

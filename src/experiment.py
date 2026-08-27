@@ -83,6 +83,7 @@ def prepare_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
 def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
              specs: pd.DataFrame, cfg: Config, series: pd.DataFrame,
+             device: str = "cpu",
              run_baselines: bool = True) -> tuple[list[dict], list[pd.DataFrame]]:
     """Huấn luyện và đánh giá toàn bộ mô hình trên một fold.
 
@@ -95,9 +96,9 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
     exp = cfg.raw.get("experiment", {})
     n_est = exp.get("n_estimators", 300)
     wanted_sets = exp.get("feature_sets") or list(models.FEATURE_SETS)
-    stage2_list = exp.get("stage2_objectives") or ["squared"]
+    s2_list = exp.get("stage2_objectives") or ["squared"]
+    s1_list = exp.get("single_stage_objectives") or ["tweedie"]
     shift = bool(exp.get("stage2_shift", False))
-    device = models.resolve_device(exp.get("device", "auto"))
     save_losses = bool(exp.get("save_series_losses", True))
 
     train = df[df.date <= fold["train_end"]]
@@ -144,19 +145,32 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
         if not cols:
             continue
 
-        # Với Two-Stage, mỗi hàm mất mát của giai đoạn hai là một biến thể
-        # riêng. Chỉ chạy nhiều biến thể trên bộ đặc trưng đầy đủ để tránh
-        # bùng nổ số lượt huấn luyện: mục đích là kiểm tra xem kết luận về
-        # Two-Stage có phụ thuộc vào lựa chọn hàm mất mát hay không.
-        variants = [("Single-Stage", models.fit_single_stage, {})]
-        s2_here = stage2_list if set_name == "full" else stage2_list[:1]
-        for s2 in s2_here:
-            tag = "Two-Stage" if s2 == stage2_list[0] else f"Two-Stage[{s2}]"
-            variants.append(("Two-Stage", models.fit_two_stage,
-                             {"stage2": s2, "shift": shift, "_tag": tag}))
+        # Thiết kế giai thừa trên bộ đặc trưng đầy đủ.
+        #
+        # Kiến trúc và hàm mất mát là hai yếu tố tách biệt. Nếu chỉ khung hai
+        # giai đoạn được thử nhiều hàm mất mát trong khi mô hình một giai đoạn
+        # cố định ở Tweedie, thì phần chênh lệch quan sát được sẽ lẫn giữa ảnh
+        # hưởng của kiến trúc và ảnh hưởng của hàm mất mát, và không thể quy
+        # kết cho yếu tố nào.
+        #
+        # Ở các bộ đặc trưng khác chỉ chạy cấu hình mặc định, vì mục đích của
+        # chúng là nghiên cứu loại trừ đặc trưng chứ không phải so kiến trúc.
+        full_set = (set_name == "full")
+        s1_here = s1_list if full_set else s1_list[:1]
+        s2_here = s2_list if full_set else s2_list[:1]
 
-        for label, fn, extra in variants:
-            tag = extra.pop("_tag", label)
+        variants = []
+        for obj in s1_here:
+            tag = ("Single-Stage" if obj == s1_list[0]
+                   else f"Single-Stage[{obj}]")
+            variants.append(("Single-Stage", models.fit_single_stage,
+                             {"objective": obj}, tag))
+        for obj in s2_here:
+            tag = "Two-Stage" if obj == s2_list[0] else f"Two-Stage[{obj}]"
+            variants.append(("Two-Stage", models.fit_two_stage,
+                             {"stage2": obj, "shift": shift}, tag))
+
+        for label, fn, extra, tag in variants:
             t0 = time.time()
             pred, _ = fn(train, test, cols, seed=cfg.seed,
                          n_estimators=n_est, device=device, **extra)
@@ -166,16 +180,17 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
                 res.update(metrics.occurrence_metrics(
                     pred.y_occurrence.to_numpy(),
                     pred.prob_occurrence.to_numpy()))
-                res["stage2"] = extra.get("stage2", "squared")
 
-            res.update({"model": tag, "feature_set": set_name,
-                        "fold": fold["fold"], "gap": fold["gap_days"],
-                        "n_features": len(cols), "device": device,
-                        "seconds": round(time.time() - t0, 1)})
+            res.update({
+                "model": tag, "arch": label, "feature_set": set_name,
+                "loss": extra.get("stage2") or extra.get("objective"),
+                "fold": fold["fold"], "gap": fold["gap_days"],
+                "n_features": len(cols), "device": device,
+                "seconds": round(time.time() - t0, 1)})
             results.append(res)
 
             s = metrics.evaluate_by_pattern(pred, series)
-            s = s.assign(model=tag, feature_set=set_name,
+            s = s.assign(model=tag, arch=label, feature_set=set_name,
                          fold=fold["fold"], gap=fold["gap_days"])
             strat_frames.append(s)
 
@@ -183,8 +198,9 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
                 loss_frames.append(significance.per_series_losses(
                     pred, f"{tag}|{set_name}", fold["fold"]))
 
-            print(f"    {tag + ' [' + set_name + ']':<32} "
-                  f"WAPE {res['wape']:.4f} | {res['seconds']:.0f}s")
+            print(f"    {tag + ' [' + set_name + ']':<34} "
+                  f"WAPE {res['wape']:.4f} | bias {res['bias_ratio']:.3f} | "
+                  f"{res['seconds']:.0f}s")
             del pred
             gc.collect()
 
@@ -205,6 +221,9 @@ def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
     use_ckpt = cfg.raw.get("experiment", {}).get("checkpoint", True)
     if use_ckpt:
         ckpt_dir.mkdir(exist_ok=True)
+
+    device = models.resolve_device(
+        cfg.raw.get("experiment", {}).get("device", "auto"))
 
     if quick:
         folds = folds[-1:]
@@ -228,7 +247,7 @@ def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
 
     for fold in todo:
         res, strat, losses = run_fold(df, fold, feature_cols, specs, cfg,
-                                      series)
+                                      series, device=device)
         if use_ckpt:
             pd.DataFrame(res).to_csv(
                 ckpt_dir / f"fold{fold['fold']}_metrics.csv", index=False)
@@ -266,18 +285,119 @@ def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
     return results
 
 
+def _bias_diagnostics(results: pd.DataFrame, gap: int) -> None:
+    """Kiểm tra tính lành mạnh của dự báo, không chỉ độ chính xác.
+
+    Một mô hình có thể đạt sai số nhỏ mà vẫn không dùng được. Trường hợp điển
+    hình là huấn luyện bằng sai số tuyệt đối trên chuỗi có quá nửa số ngày
+    không phát sinh nhu cầu: đại lượng mà sai số tuyệt đối tối thiểu hoá là
+    trung vị có điều kiện, và trung vị khi đó bằng đúng không. Mô hình học được
+    cách dự báo bằng không cho gần như mọi ngày, đạt MAE rất tốt, nhưng gây
+    hết hàng liên tục nếu đưa vào vận hành.
+
+    Bảng này phơi bày hiện tượng đó qua hai con số: tỷ số tổng dự báo trên tổng
+    nhu cầu thực, và tỷ lệ dự báo gần bằng không.
+    """
+    if "bias_ratio" not in results.columns:
+        return
+    _banner(f"CHẨN ĐOÁN ĐỘ CHỆCH (gap={gap})")
+
+    tab = (results[results.feature_set.isin(["full", "-"])]
+           .groupby("model", as_index=False)
+           .agg(wape=("wape", "mean"), bias=("bias_ratio", "mean"),
+                near_zero=("near_zero_rate", "mean"))
+           .sort_values("wape"))
+
+    tab["đánh_giá"] = np.where(
+        tab.bias < 0.85, "dự báo THIẾU nghiêm trọng",
+        np.where(tab.bias > 1.15, "dự báo THỪA nghiêm trọng", "cân bằng"))
+
+    print(tab.round(4).to_string(index=False))
+    print("\n  bias = tổng dự báo / tổng nhu cầu thực; bằng 1 là cân bằng.")
+    print("  near_zero = tỷ lệ dự báo nhỏ hơn 0,5 đơn vị.")
+    print("  Với bài toán tồn kho, dự báo thiếu hệ thống gây hết hàng, "
+          "nên nguy hiểm\n  hơn sai số ngẫu nhiên cùng độ lớn.")
+
+    bad = tab[tab.bias < 0.85]
+    if len(bad):
+        print(f"\n  [CẢNH BÁO] {len(bad)} mô hình dự báo thiếu nghiêm trọng: "
+              f"{', '.join(bad.model)}")
+        print("  Không nên kết luận các mô hình này tốt chỉ dựa trên WAPE.")
+
+
+def _matched_loss_comparison(results: pd.DataFrame, out_dir: Path,
+                             gap: int) -> None:
+    """So sánh kiến trúc trong điều kiện hàm mất mát tương đương.
+
+    So một mô hình huấn luyện bằng sai số tuyệt đối với một mô hình huấn luyện
+    bằng Tweedie, rồi đánh giá bằng WAPE, là phép so lệch: chỉ số đánh giá dựa
+    trên sai số tuyệt đối nên đương nhiên ưu ái mô hình đã tối ưu đúng đại
+    lượng đó. Phần chênh lệch quan sát được khi ấy phản ánh lựa chọn hàm mất
+    mát chứ không phải ưu thế của kiến trúc.
+
+    Bảng dưới ghép cặp các cấu hình dùng cùng họ hàm mất mát, để chênh lệch
+    còn lại quy được cho kiến trúc.
+    """
+    if "arch" not in results.columns or "loss" not in results.columns:
+        return
+
+    full = results[results.feature_set == "full"]
+    if not len(full):
+        return
+
+    _banner(f"SO SÁNH KHỚP HÀM MẤT MÁT (gap={gap})")
+
+    # Nhóm theo họ hàm mất mát: L1 đánh giá bằng WAPE/MAE, L2 bằng RMSE
+    families = {
+        "L1 (đánh giá bằng WAPE/MAE)": (["absolute"], "wape"),
+        "L2 (đánh giá bằng RMSE)": (["squared", "tweedie", "gamma"], "rmse"),
+    }
+
+    rows = []
+    for fam, (losses, metric) in families.items():
+        sub = full[full.loss.isin(losses)]
+        if not len(sub):
+            continue
+        agg = (sub.groupby(["arch", "loss"], as_index=False)
+               .agg(**{metric: (metric, "mean"),
+                       "bias": ("bias_ratio", "mean")})
+               .sort_values(metric))
+        print(f"\n[{fam}]")
+        print(agg.round(4).to_string(index=False))
+
+        best_arch = agg.iloc[0]["arch"]
+        rows.append({"family": fam, "metric": metric,
+                     "best_arch": best_arch,
+                     "best_loss": agg.iloc[0]["loss"],
+                     "best_value": float(agg.iloc[0][metric])})
+
+    if rows:
+        summary = pd.DataFrame(rows)
+        summary.to_csv(out_dir / "matched_loss_comparison.csv", index=False)
+        print("\n  Chỉ khi hai kiến trúc dùng cùng họ hàm mất mát thì chênh "
+              "lệch mới\n  quy được cho kiến trúc. Đối chiếu kết luận giữa "
+              "hai họ: nếu cùng một\n  kiến trúc thắng ở cả hai, kết luận "
+              "vững; nếu khác nhau, ưu thế phụ\n  thuộc chỉ số và phải nói rõ "
+              "điều đó.")
+
+
 def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
                out_dir: Path, gap: int) -> None:
     """In các bảng tổng hợp tương ứng từng câu hỏi nghiên cứu."""
     agg = (results.groupby(["model", "feature_set"], as_index=False)
            .agg(wape=("wape", "mean"), mae=("mae", "mean"),
                 rmse=("rmse", "mean"), rmsse=("rmsse", "mean"),
+                bias=("bias_ratio", "mean"),
+                near_zero=("near_zero_rate", "mean"),
                 seconds=("seconds", "mean"))
            .sort_values("wape"))
     agg.to_csv(out_dir / "summary.csv", index=False)
 
     _banner(f"RQ1 — SO SÁNH MÔ HÌNH (gap={gap}, trung bình các fold)")
     print(agg.round(4).to_string(index=False))
+
+    _bias_diagnostics(results, gap)
+    _matched_loss_comparison(results, out_dir, gap)
 
     # ---------------- RQ2 ----------------
     _banner(f"RQ2 — ĐÓNG GÓP CỦA TỪNG NHÓM ĐẶC TRƯNG (gap={gap})")
@@ -319,19 +439,35 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
     _banner(f"RQ3 — HIỆU QUẢ THEO NHÓM MẪU NHU CẦU (gap={gap})")
     full = strat[strat.feature_set.isin(["full", "-"])]
 
+    # So sánh biến thể TỐT NHẤT của mỗi kiến trúc, không phải bản mặc định.
+    # Dùng bản mặc định sẽ đánh giá thấp kiến trúc nào có cấu hình mặc định
+    # kém hơn, và câu trả lời cho RQ3 khi ấy phản ánh lựa chọn siêu tham số
+    # chứ không phải bản chất kiến trúc.
+    best = {}
+    if "arch" in full.columns:
+        for arch in ("Single-Stage", "Two-Stage"):
+            sub = full[full.arch == arch]
+            if len(sub):
+                best[arch] = (sub.groupby("model")["wape"].mean().idxmin())
+        if best:
+            print("  Biến thể tốt nhất của mỗi kiến trúc:")
+            for k, v in best.items():
+                print(f"    {k:<14} -> {v}")
+            print()
+
     pivot = (full.pivot_table(index="pattern", columns="model",
                               values="wape", aggfunc="mean").round(4))
-    cols = [c for c in ["Croston", "SBA", "TSB",
-                        "Single-Stage", "Two-Stage"] if c in pivot.columns]
+    keep = ["Croston", "SBA", "TSB"] + list(best.values())
+    cols = [c for c in dict.fromkeys(keep) if c in pivot.columns]
     pivot = pivot[cols]
 
-    if {"Single-Stage", "Two-Stage"}.issubset(pivot.columns):
-        # Số âm nghĩa là Two-Stage tốt hơn (WAPE thấp hơn)
-        pivot["Two−Single"] = (pivot["Two-Stage"]
-                               - pivot["Single-Stage"]).round(4)
+    if len(best) == 2:
+        a, b = best["Single-Stage"], best["Two-Stage"]
+        pivot["Two−Single"] = (pivot[b] - pivot[a]).round(4)
         pivot["Two thắng?"] = np.where(pivot["Two−Single"] < 0, "có", "không")
 
-    info = (full[full.model == "Two-Stage"]
+    ref_model = best.get("Two-Stage", "Two-Stage")
+    info = (full[full.model == ref_model]
             .groupby("pattern")[["n_series", "zero_rate"]].mean().round(4))
     out = info.join(pivot)
     order_p = ["Smooth", "Erratic", "Intermittent", "Lumpy"]
