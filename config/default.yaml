@@ -52,6 +52,24 @@ experiment:
   # giới hạn phiên làm việc của Kaggle. 200 là mức cân bằng hợp lý.
   n_estimators: 200
 
+  # Thiết bị tính toán: "auto" tự dò GPU và lùi về CPU nếu không có.
+  # GPU rút ngắn thời gian huấn luyện rất nhiều với dữ liệu quy mô này.
+  device: auto
+
+  # Hàm mất mát cho giai đoạn hai của khung Two-Stage.
+  # Giai đoạn hai chỉ học trên nhu cầu dương nên phân phối mục tiêu bị chặn
+  # dưới và lệch phải; sai số bình phương giả định sai số đối xứng nên không
+  # phù hợp. Liệt kê nhiều giá trị để so sánh trong cùng một lần chạy.
+  #   squared      - mốc so sánh, cấu hình ban đầu
+  #   gamma        - liên tục dương lệch phải, chuẩn trong tài liệu hurdle
+  #   poisson      - phân phối đếm
+  #   absolute     - khớp với WAPE vốn dựa trên sai số tuyệt đối
+  #   log_squared  - biến đổi log rồi dùng sai số bình phương
+  stage2_objectives: [squared, gamma, absolute]
+
+  # Mô hình hoá phần dư y-1 thay vì y, vì nhu cầu dương nhỏ nhất là 1.
+  stage2_shift: false
+
   # Bộ đặc trưng đưa vào nghiên cứu loại trừ, xếp chồng dần từng nhóm một.
   # Bỏ bớt phần tử ở đây để rút ngắn thời gian nếu cần.
   feature_sets:
@@ -64,6 +82,9 @@ experiment:
   # Ghi kết quả sau mỗi fold. Nếu phiên làm việc bị ngắt giữa chừng, lần chạy
   # sau sẽ bỏ qua những fold đã xong thay vì làm lại từ đầu.
   checkpoint: true
+
+  # Lưu sai số theo từng chuỗi để chạy kiểm định thống kê về sau.
+  save_series_losses: true
 
 output:
   dir: "artifacts"

@@ -369,3 +369,100 @@ class TestBaselines:
         y = np.zeros(60)
         y[:20:2] = 5.0                   # chỉ bán trong 20 ngày đầu
         assert croston(y, 0.1, "tsb") < croston(y, 0.1, "classic")
+
+
+# --------------------------------------------------------------------------- #
+# Kiểm định thống kê
+# --------------------------------------------------------------------------- #
+class TestSignificance:
+    def test_dm_detects_clear_difference(self):
+        """Khi mô hình A tệ hơn hẳn, DM phải bác bỏ giả thuyết không."""
+        from src.significance import diebold_mariano
+        rng = np.random.default_rng(0)
+        err_a = rng.normal(0, 3.0, 500)     # sai số lớn
+        err_b = rng.normal(0, 1.0, 500)     # sai số nhỏ
+        res = diebold_mariano(err_a, err_b, horizon=7)
+        assert res["p_value"] < 0.01
+        assert res["better"] == "B"
+
+    def test_dm_no_difference_when_identical(self):
+        from src.significance import diebold_mariano
+        rng = np.random.default_rng(1)
+        e = rng.normal(0, 1.0, 500)
+        res = diebold_mariano(e, e.copy(), horizon=7)
+        assert res["better"] == "không khác biệt"
+
+    def test_holm_is_more_conservative_than_raw(self):
+        """Hiệu chỉnh Holm phải loại bớt kết luận so với ngưỡng thô."""
+        from src.significance import holm_correction
+        ps = [0.001, 0.02, 0.03, 0.04, 0.045]
+        rejected = holm_correction(ps, alpha=0.05)
+        assert rejected[0] is True                 # nhỏ nhất vẫn đạt
+        assert sum(rejected) < sum(p < 0.05 for p in ps)
+
+    def test_holm_stops_at_first_failure(self):
+        """Holm xét theo thứ tự p tăng dần và dừng ở giá trị đầu tiên không đạt.
+
+        Với [0.9, 0.001]: xét 0.001 trước, đạt ngưỡng 0.05/2 nên bác bỏ; sang
+        0.9 thì không đạt nên dừng. Kết quả đúng là [False, True] — thứ tự
+        trong danh sách đầu vào không ảnh hưởng tới việc giá trị nào được xét
+        trước.
+        """
+        from src.significance import holm_correction
+        assert holm_correction([0.9, 0.001]) == [False, True]
+        # cả hai đều lớn -> không bác bỏ cái nào
+        assert holm_correction([0.6, 0.4]) == [False, False]
+
+    def test_paired_test_finds_consistent_winner(self):
+        from src.significance import paired_test_by_series
+        rng = np.random.default_rng(2)
+        n = 300
+        base = rng.gamma(2, 1, n)
+        df = pd.concat([
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "A", "mae": base + 0.3}),
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "B", "mae": base}),
+        ])
+        res = paired_test_by_series(df, "A", "B")
+        assert res["p_wilcoxon"] < 0.001
+        assert res["verdict"] == "B tốt hơn"
+
+
+class TestStage2Objectives:
+    def test_all_objectives_registered(self):
+        from src.models import STAGE2_OBJECTIVES
+        assert set(STAGE2_OBJECTIVES) >= {"squared", "gamma", "absolute",
+                                          "poisson", "log_squared"}
+
+    def test_log_transform_roundtrip(self):
+        """Biến đổi log rồi hoàn nguyên phải trả về giá trị ban đầu."""
+        from src.models import _predict_stage2, STAGE2_OBJECTIVES
+
+        class Stub:
+            def predict(self, X):
+                return np.log1p(np.array([1.0, 5.0, 20.0]))
+
+        got = _predict_stage2(Stub(), None,
+                              STAGE2_OBJECTIVES["log_squared"], shift=False)
+        assert np.allclose(got, [1.0, 5.0, 20.0])
+
+    def test_shift_adds_one_back(self):
+        from src.models import _predict_stage2, STAGE2_OBJECTIVES
+
+        class Stub:
+            def predict(self, X):
+                return np.array([0.0, 2.0, 9.0])
+
+        got = _predict_stage2(Stub(), None, STAGE2_OBJECTIVES["squared"],
+                              shift=True)
+        assert np.allclose(got, [1.0, 3.0, 10.0])
+
+    def test_device_falls_back_to_cpu(self):
+        """Yêu cầu CPU phải luôn trả về CPU, không phụ thuộc máy."""
+        from src.models import resolve_device
+        assert resolve_device("cpu") == "cpu"
+
+    def test_device_auto_returns_valid_value(self):
+        from src.models import resolve_device
+        assert resolve_device("auto") in ("cpu", "cuda")

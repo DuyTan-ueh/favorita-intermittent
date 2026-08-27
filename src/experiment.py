@@ -23,7 +23,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from . import metrics, models
+from . import metrics, models, significance
 from .config import Config, load_config
 
 KEYS = ["store_nbr", "item_nbr"]
@@ -95,6 +95,10 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
     exp = cfg.raw.get("experiment", {})
     n_est = exp.get("n_estimators", 300)
     wanted_sets = exp.get("feature_sets") or list(models.FEATURE_SETS)
+    stage2_list = exp.get("stage2_objectives") or ["squared"]
+    shift = bool(exp.get("stage2_shift", False))
+    device = models.resolve_device(exp.get("device", "auto"))
+    save_losses = bool(exp.get("save_series_losses", True))
 
     train = df[df.date <= fold["train_end"]]
     test = df[(df.date >= fold["test_start"]) & (df.date <= fold["test_end"])]
@@ -103,7 +107,7 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
           f"(tới {fold['train_end'].date()}) | test {len(test):,} dòng")
 
     scales = metrics.compute_scales(train)
-    results, strat_frames = [], []
+    results, strat_frames, loss_frames = [], [], []
 
     # ---- Baseline cổ điển (RQ1) ----
     if run_baselines:
@@ -122,6 +126,9 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
             s = s.assign(model=label, feature_set="-",
                          fold=fold["fold"], gap=fold["gap_days"])
             strat_frames.append(s)
+            if save_losses:
+                loss_frames.append(significance.per_series_losses(
+                    pred, f"{label}|-", fold["fold"]))
 
             print(f"    {label:<26} WAPE {res['wape']:.4f} | "
                   f"{res['seconds']:.0f}s")
@@ -137,35 +144,51 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
         if not cols:
             continue
 
-        for label, fn in [("Single-Stage", models.fit_single_stage),
-                          ("Two-Stage", models.fit_two_stage)]:
+        # Với Two-Stage, mỗi hàm mất mát của giai đoạn hai là một biến thể
+        # riêng. Chỉ chạy nhiều biến thể trên bộ đặc trưng đầy đủ để tránh
+        # bùng nổ số lượt huấn luyện: mục đích là kiểm tra xem kết luận về
+        # Two-Stage có phụ thuộc vào lựa chọn hàm mất mát hay không.
+        variants = [("Single-Stage", models.fit_single_stage, {})]
+        s2_here = stage2_list if set_name == "full" else stage2_list[:1]
+        for s2 in s2_here:
+            tag = "Two-Stage" if s2 == stage2_list[0] else f"Two-Stage[{s2}]"
+            variants.append(("Two-Stage", models.fit_two_stage,
+                             {"stage2": s2, "shift": shift, "_tag": tag}))
+
+        for label, fn, extra in variants:
+            tag = extra.pop("_tag", label)
             t0 = time.time()
             pred, _ = fn(train, test, cols, seed=cfg.seed,
-                         n_estimators=n_est)
+                         n_estimators=n_est, device=device, **extra)
             res = metrics.evaluate_forecast(pred, scales)
 
             if label == "Two-Stage":
                 res.update(metrics.occurrence_metrics(
                     pred.y_occurrence.to_numpy(),
                     pred.prob_occurrence.to_numpy()))
+                res["stage2"] = extra.get("stage2", "squared")
 
-            res.update({"model": label, "feature_set": set_name,
+            res.update({"model": tag, "feature_set": set_name,
                         "fold": fold["fold"], "gap": fold["gap_days"],
-                        "n_features": len(cols),
+                        "n_features": len(cols), "device": device,
                         "seconds": round(time.time() - t0, 1)})
             results.append(res)
 
             s = metrics.evaluate_by_pattern(pred, series)
-            s = s.assign(model=label, feature_set=set_name,
+            s = s.assign(model=tag, feature_set=set_name,
                          fold=fold["fold"], gap=fold["gap_days"])
             strat_frames.append(s)
 
-            print(f"    {label + ' [' + set_name + ']':<26} "
+            if save_losses:
+                loss_frames.append(significance.per_series_losses(
+                    pred, f"{tag}|{set_name}", fold["fold"]))
+
+            print(f"    {tag + ' [' + set_name + ']':<32} "
                   f"WAPE {res['wape']:.4f} | {res['seconds']:.0f}s")
             del pred
             gc.collect()
 
-    return results, strat_frames
+    return results, strat_frames, loss_frames
 
 
 def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
@@ -204,12 +227,17 @@ def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
         print("  Mọi fold đã hoàn tất, chỉ tổng hợp lại kết quả")
 
     for fold in todo:
-        res, strat = run_fold(df, fold, feature_cols, specs, cfg, series)
+        res, strat, losses = run_fold(df, fold, feature_cols, specs, cfg,
+                                      series)
         if use_ckpt:
             pd.DataFrame(res).to_csv(
                 ckpt_dir / f"fold{fold['fold']}_metrics.csv", index=False)
             pd.concat(strat, ignore_index=True).to_csv(
                 ckpt_dir / f"fold{fold['fold']}_pattern.csv", index=False)
+            if losses:
+                pd.concat(losses, ignore_index=True).to_parquet(
+                    ckpt_dir / f"fold{fold['fold']}_losses.parquet",
+                    index=False)
             print(f"  [đã lưu] checkpoint fold {fold['fold']}")
         gc.collect()
 
@@ -228,7 +256,13 @@ def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
     if strat is not None:
         strat.to_csv(out_dir / "metrics_by_pattern.csv", index=False)
 
+    loss_files = sorted(ckpt_dir.glob("fold*_losses.parquet")) if use_ckpt else []
+    losses = (pd.concat([pd.read_parquet(f) for f in loss_files],
+                        ignore_index=True) if loss_files else None)
+
     _summarise(results, strat, out_dir, gap)
+    if losses is not None:
+        _run_significance(losses, results, out_dir, gap)
     return results
 
 
@@ -309,6 +343,57 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
     out.to_csv(out_dir / "rq3_model_by_pattern.csv")
 
     print(f"\nKết quả lưu tại: {out_dir}")
+
+
+def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
+                      out_dir: Path, gap: int) -> None:
+    """Kiểm định xem chênh lệch giữa các mô hình có ý nghĩa thống kê không.
+
+    Chênh lệch WAPE trong nghiên cứu này chỉ vào khoảng vài phần nghìn. Một
+    bảng số trung bình không đủ để khẳng định đó là khác biệt thật, nên phần
+    này đối chiếu từng mô hình với mô hình tốt nhất bằng kiểm định ghép cặp
+    trên từng chuỗi, kèm hiệu chỉnh cho việc so sánh nhiều lần.
+    """
+    _banner(f"KIỂM ĐỊNH THỐNG KÊ (gap={gap})")
+
+    best = (results.groupby(["model", "feature_set"])["wape"].mean()
+            .idxmin())
+    reference = f"{best[0]}|{best[1]}"
+    print(f"  Mô hình tham chiếu: {reference}\n")
+
+    table = significance.compare_all(losses, reference)
+    if not len(table):
+        print("  Không đủ dữ liệu để kiểm định")
+        return
+
+    show = table[["model_b", "n_series", "mean_diff", "b_win_rate",
+                  "p_wilcoxon", "ý_nghĩa"]].rename(columns={
+        "model_b": "so_với", "mean_diff": "chênh_MAE",
+        "b_win_rate": "tỷ_lệ_thắng"})
+    print(show.round(5).to_string(index=False))
+    print("\n  chênh_MAE âm nghĩa là mô hình tham chiếu tốt hơn.")
+    print("  tỷ_lệ_thắng là tỷ lệ chuỗi mà mô hình kia thắng tham chiếu.")
+    print("  Cột ý_nghĩa đã hiệu chỉnh Holm cho nhiều phép so sánh.")
+    table.to_csv(out_dir / "significance_vs_best.csv", index=False)
+
+    # So sánh trực tiếp cặp quan trọng nhất của RQ1
+    pooled = (losses.groupby(["model_key", "store_nbr", "item_nbr"],
+                             as_index=False).agg(mae=("mae", "mean")))
+    pair = [("Single-Stage|full", "Two-Stage|full")]
+    rows = [significance.paired_test_by_series(pooled, a, b) for a, b in pair
+            if a in set(pooled.model_key) and b in set(pooled.model_key)]
+    if rows:
+        print("\n  RQ1 — so sánh trực tiếp Single-Stage và Two-Stage:")
+        for r in rows:
+            print(f"    {r['model_a']} vs {r['model_b']}")
+            print(f"      chênh MAE trung bình : {r['mean_diff']:+.5f}")
+            print(f"      tỷ lệ chuỗi B thắng  : {r['b_win_rate']:.1%}")
+            print(f"      p (t-test)           : {r['p_ttest']:.3e}")
+            print(f"      p (Wilcoxon)         : {r['p_wilcoxon']:.3e}")
+            print(f"      kết luận             : {r['verdict']}")
+        pd.DataFrame(rows).to_csv(out_dir / "significance_rq1.csv", index=False)
+
+    print(f"\n  Đã lưu kết quả kiểm định vào {out_dir}")
 
 
 def main(argv: list[str] | None = None) -> int:
