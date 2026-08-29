@@ -208,7 +208,8 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
 
 
 def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
-                   quick: bool = False) -> pd.DataFrame:
+                   quick: bool = False,
+                   summarize_only: bool = False) -> pd.DataFrame:
     _banner(f"THỰC NGHIỆM — gap = {gap} ngày")
 
     specs = pd.read_csv(cfg.out_dir / "feature_specs.csv")
@@ -239,7 +240,14 @@ def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
         else:
             todo.append(f)
 
-    if todo:
+    if summarize_only:
+        if todo:
+            raise RuntimeError(
+                f"Còn {len(todo)} fold chưa có checkpoint, không thể chỉ "
+                f"tổng hợp. Bỏ cờ --summarize-only để chạy chúng.")
+        print("  [chỉ tổng hợp] dùng lại checkpoint, không huấn luyện lại")
+        todo = []
+    elif todo:
         df = load_features(cfg, max_parts)
         df, feature_cols = prepare_matrix(df)
     else:
@@ -308,9 +316,12 @@ def _bias_diagnostics(results: pd.DataFrame, gap: int) -> None:
                 near_zero=("near_zero_rate", "mean"))
            .sort_values("wape"))
 
+    # Ngưỡng 5%: với bài toán tồn kho, lệch 10% đã đủ gây hết hàng hoặc ứ
+    # đọng trên diện rộng. Ngưỡng lỏng hơn sẽ bỏ lọt đúng những mô hình đang
+    # đạt điểm số tốt nhờ dự báo thấp.
     tab["đánh_giá"] = np.where(
-        tab.bias < 0.85, "dự báo THIẾU nghiêm trọng",
-        np.where(tab.bias > 1.15, "dự báo THỪA nghiêm trọng", "cân bằng"))
+        tab.bias < 0.95, "dự báo THIẾU",
+        np.where(tab.bias > 1.05, "dự báo THỪA", "cân bằng"))
 
     print(tab.round(4).to_string(index=False))
     print("\n  bias = tổng dự báo / tổng nhu cầu thực; bằng 1 là cân bằng.")
@@ -318,11 +329,23 @@ def _bias_diagnostics(results: pd.DataFrame, gap: int) -> None:
     print("  Với bài toán tồn kho, dự báo thiếu hệ thống gây hết hàng, "
           "nên nguy hiểm\n  hơn sai số ngẫu nhiên cùng độ lớn.")
 
-    bad = tab[tab.bias < 0.85]
+    bad = tab[tab.bias < 0.95]
     if len(bad):
-        print(f"\n  [CẢNH BÁO] {len(bad)} mô hình dự báo thiếu nghiêm trọng: "
+        print(f"\n  [CẢNH BÁO] {len(bad)} mô hình dự báo thiếu: "
               f"{', '.join(bad.model)}")
-        print("  Không nên kết luận các mô hình này tốt chỉ dựa trên WAPE.")
+
+    # Kiểm tra xem thứ hạng theo WAPE có bị chi phối bởi độ chệch không.
+    # Nếu hai đại lượng tương quan mạnh, mô hình đứng đầu bảng WAPE đang đạt
+    # điểm cao một phần nhờ dự báo thấp chứ không phải nhờ dự báo đúng hơn.
+    if len(tab) >= 4:
+        corr = float(tab.wape.corr(tab.bias))
+        print(f"\n  Tương quan giữa WAPE và độ chệch: {corr:+.3f}")
+        if corr > 0.6:
+            print("  [QUAN TRỌNG] Tương quan dương mạnh: WAPE đang THƯỞNG cho "
+                  "việc dự báo thiếu.\n"
+                  "  Không được xếp hạng mô hình chỉ bằng WAPE trên dữ liệu "
+                  "này. Phải đối chiếu\n"
+                  "  với RMSE, RMSSE và độ chệch trước khi kết luận.")
 
 
 def _matched_loss_comparison(results: pd.DataFrame, out_dir: Path,
@@ -381,6 +404,68 @@ def _matched_loss_comparison(results: pd.DataFrame, out_dir: Path,
               "điều đó.")
 
 
+def _recommend_model(results: pd.DataFrame, out_dir: Path,
+                     gap: int, bias_tol: float = 0.05) -> str:
+    """Chọn mô hình khuyến nghị dựa trên nhiều chỉ số, không chỉ một.
+
+    Xếp hạng bằng một chỉ số duy nhất là không đủ trên bài toán này. Sai số
+    tuyệt đối được tối thiểu hoá tại trung vị, mà trên dữ liệu nhiều số không
+    trung vị nằm thấp hơn kỳ vọng, nên WAPE có xu hướng ưu ái những mô hình
+    dự báo thấp một cách hệ thống. Một mô hình như vậy đứng đầu bảng WAPE
+    nhưng gây hết hàng khi đưa vào vận hành.
+
+    Quy tắc ở đây: trước hết loại những mô hình lệch quá ngưỡng cho phép, sau
+    đó mới xếp hạng phần còn lại. Cách này ưu tiên tính dùng được trước, độ
+    chính xác sau — đúng thứ tự ưu tiên của bài toán tồn kho.
+    """
+    _banner(f"MÔ HÌNH KHUYẾN NGHỊ (gap={gap})")
+
+    tab = (results[results.feature_set == "full"]
+           .groupby("model", as_index=False)
+           .agg(wape=("wape", "mean"), rmse=("rmse", "mean"),
+                rmsse=("rmsse", "mean"), bias=("bias_ratio", "mean")))
+    if not len(tab):
+        return ""
+
+    lo, hi = 1 - bias_tol, 1 + bias_tol
+    tab["đạt_độ_chệch"] = tab.bias.between(lo, hi)
+
+    print(f"  Điều kiện loại: độ chệch phải nằm trong [{lo:.2f}, {hi:.2f}]\n")
+    print(tab.round(4).to_string(index=False))
+
+    eligible = tab[tab["đạt_độ_chệch"]]
+    if not len(eligible):
+        print("\n  [CẢNH BÁO] không mô hình nào đạt ngưỡng độ chệch.")
+        return ""
+
+    # Xếp hạng trung bình trên ba chỉ số để không phụ thuộc vào một chỉ số
+    ranks = eligible[["wape", "rmse", "rmsse"]].rank()
+    eligible = eligible.assign(hạng_TB=ranks.mean(axis=1))
+    eligible = eligible.sort_values("hạng_TB")
+
+    best = eligible.iloc[0]
+    print(f"\n  Sau khi loại theo độ chệch, xếp hạng trung bình ba chỉ số:")
+    print(eligible[["model", "wape", "rmse", "rmsse", "bias", "hạng_TB"]]
+          .round(4).to_string(index=False))
+    print(f"\n  >>> KHUYẾN NGHỊ: {best.model}")
+    print(f"      WAPE {best.wape:.4f} | RMSE {best.rmse:.4f} | "
+          f"RMSSE {best.rmsse:.4f} | độ chệch {best.bias:.4f}")
+
+    excluded = tab[~tab["đạt_độ_chệch"]].sort_values("wape")
+    if len(excluded):
+        top_wape = tab.nsmallest(1, "wape").iloc[0]
+        if not top_wape["đạt_độ_chệch"]:
+            print(f"\n  Lưu ý: mô hình dẫn đầu theo WAPE là {top_wape.model} "
+                  f"(WAPE {top_wape.wape:.4f}),\n"
+                  f"  nhưng bị loại vì độ chệch {top_wape.bias:.3f} — dự báo "
+                  f"thiếu khoảng {(1-top_wape.bias)*100:.0f}%.\n"
+                  f"  Đây chính là biểu hiện của việc WAPE thưởng cho dự báo "
+                  f"thiếu.")
+
+    eligible.to_csv(out_dir / "recommended_model.csv", index=False)
+    return str(best.model)
+
+
 def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
                out_dir: Path, gap: int) -> None:
     """In các bảng tổng hợp tương ứng từng câu hỏi nghiên cứu."""
@@ -398,6 +483,7 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
 
     _bias_diagnostics(results, gap)
     _matched_loss_comparison(results, out_dir, gap)
+    recommended = _recommend_model(results, out_dir, gap)
 
     # ---------------- RQ2 ----------------
     _banner(f"RQ2 — ĐÓNG GÓP CỦA TỪNG NHÓM ĐẶC TRƯNG (gap={gap})")
@@ -443,16 +529,27 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
     # Dùng bản mặc định sẽ đánh giá thấp kiến trúc nào có cấu hình mặc định
     # kém hơn, và câu trả lời cho RQ3 khi ấy phản ánh lựa chọn siêu tham số
     # chứ không phải bản chất kiến trúc.
+    # Chọn biến thể tốt nhất của mỗi kiến trúc, nhưng chỉ trong số những
+    # biến thể có độ chệch chấp nhận được. Nếu xếp hạng thuần theo WAPE, ta sẽ
+    # chọn phải các biến thể dùng sai số tuyệt đối — vốn đứng đầu bảng WAPE
+    # nhờ dự báo thiếu — và câu trả lời cho RQ3 khi ấy phản ánh mức độ chệch
+    # chứ không phải ưu thế của kiến trúc.
     best = {}
-    if "arch" in full.columns:
+    if "arch" in full.columns and "bias_ratio" in full.columns:
         for arch in ("Single-Stage", "Two-Stage"):
             sub = full[full.arch == arch]
-            if len(sub):
-                best[arch] = (sub.groupby("model")["wape"].mean().idxmin())
+            if not len(sub):
+                continue
+            agg = sub.groupby("model").agg(
+                wape=("wape", "mean"), bias=("bias_ratio", "mean"))
+            ok = agg[agg.bias.between(0.95, 1.05)]
+            best[arch] = (ok if len(ok) else agg).wape.idxmin()
         if best:
-            print("  Biến thể tốt nhất của mỗi kiến trúc:")
+            print("  Biến thể tốt nhất của mỗi kiến trúc "
+                  "(đã loại biến thể lệch quá 5%):")
             for k, v in best.items():
-                print(f"    {k:<14} -> {v}")
+                b = full[full.model == v]["bias_ratio"].mean()
+                print(f"    {k:<14} -> {v:<26} (độ chệch {b:.3f})")
             print()
 
     pivot = (full.pivot_table(index="pattern", columns="model",
@@ -503,29 +600,44 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
         return
 
     show = table[["model_b", "n_series", "mean_diff", "b_win_rate",
-                  "p_wilcoxon", "ý_nghĩa"]].rename(columns={
-        "model_b": "so_với", "mean_diff": "chênh_MAE",
-        "b_win_rate": "tỷ_lệ_thắng"})
+                  "p_wilcoxon", "cohen_d", "độ_lớn", "ý_nghĩa"]].rename(
+        columns={"model_b": "so_với", "mean_diff": "chênh_MAE",
+                 "b_win_rate": "tỷ_lệ_thắng"})
     print(show.round(5).to_string(index=False))
     print("\n  chênh_MAE âm nghĩa là mô hình tham chiếu tốt hơn.")
     print("  tỷ_lệ_thắng là tỷ lệ chuỗi mà mô hình kia thắng tham chiếu.")
     print("  Cột ý_nghĩa đã hiệu chỉnh Holm cho nhiều phép so sánh.")
+    print("\n  Với hai mươi lăm nghìn chuỗi, lực kiểm định cao tới mức gần "
+          "như mọi chênh\n  lệch đều đạt ý nghĩa thống kê. Cột độ_lớn mới cho "
+          "biết khác biệt có đáng\n  kể trong thực tế hay không.")
     table.to_csv(out_dir / "significance_vs_best.csv", index=False)
 
     # So sánh trực tiếp cặp quan trọng nhất của RQ1
     pooled = (losses.groupby(["model_key", "store_nbr", "item_nbr"],
                              as_index=False).agg(mae=("mae", "mean")))
-    pair = [("Single-Stage|full", "Two-Stage|full")]
+    # Ghép cặp theo hàm mất mát tương đương. So Two-Stage dùng bình phương
+    # sai số với Single-Stage dùng Tweedie là phép so lệch, vì Tweedie vốn
+    # được thiết kế cho dữ liệu có khối xác suất tại không còn bình phương sai
+    # số thì không. Cặp đúng là Gamma cho giai đoạn hai đối với Tweedie cho mô
+    # hình một giai đoạn: cả hai đều là hàm mất mát phù hợp phân phối của
+    # chính bài toán mà chúng giải.
+    pair = [
+        ("Single-Stage|full", "Two-Stage[gamma]|full"),
+        ("Single-Stage[absolute]|full", "Two-Stage[absolute]|full"),
+        ("Single-Stage[squared]|full", "Two-Stage|full"),
+        ("Single-Stage|full", "Two-Stage|full"),
+    ]
     rows = [significance.paired_test_by_series(pooled, a, b) for a, b in pair
             if a in set(pooled.model_key) and b in set(pooled.model_key)]
     if rows:
-        print("\n  RQ1 — so sánh trực tiếp Single-Stage và Two-Stage:")
+        print("\n  RQ1 — so sánh ghép cặp theo hàm mất mát tương đương:")
         for r in rows:
-            print(f"    {r['model_a']} vs {r['model_b']}")
+            print(f"\n    {r['model_a']}\n      vs {r['model_b']}")
             print(f"      chênh MAE trung bình : {r['mean_diff']:+.5f}")
             print(f"      tỷ lệ chuỗi B thắng  : {r['b_win_rate']:.1%}")
-            print(f"      p (t-test)           : {r['p_ttest']:.3e}")
             print(f"      p (Wilcoxon)         : {r['p_wilcoxon']:.3e}")
+            print(f"      độ lớn hiệu ứng      : {r['cohen_d']:.4f} "
+                  f"({r['độ_lớn']})")
             print(f"      kết luận             : {r['verdict']}")
         pd.DataFrame(rows).to_csv(out_dir / "significance_rq1.csv", index=False)
 
@@ -541,6 +653,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="giới hạn số tệp lô nạp vào, dùng khi thiếu bộ nhớ")
     ap.add_argument("--quick", action="store_true",
                     help="chỉ chạy fold cuối để kiểm thử nhanh")
+    ap.add_argument("--summarize-only", action="store_true",
+                    help="dựng lại toàn bộ bảng tổng hợp từ checkpoint đã có, "
+                         "không huấn luyện lại mô hình")
     args = ap.parse_args(argv)
 
     cfg = load_config(args.config)
@@ -549,7 +664,8 @@ def main(argv: list[str] | None = None) -> int:
 
     frames = []
     for gap in gaps:
-        frames.append(run_experiment(cfg, gap, args.max_parts, args.quick))
+        frames.append(run_experiment(cfg, gap, args.max_parts, args.quick,
+                                     args.summarize_only))
 
     if len(frames) > 1:
         _banner("SO SÁNH GIỮA CÁC GIÁ TRỊ GAP")

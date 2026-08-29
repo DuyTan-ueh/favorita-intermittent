@@ -635,3 +635,47 @@ class TestModuleIntegrity:
             assert not late, (
                 f"{mod.name}: {late} được định nghĩa sau khối "
                 f"if __name__ == '__main__', nên sẽ chưa tồn tại khi chạy")
+
+
+class TestModelRecommendation:
+    def test_biased_model_excluded_from_recommendation(self):
+        """Mô hình lệch quá ngưỡng phải bị loại dù đứng đầu bảng WAPE.
+
+        Tái hiện đúng tình huống gặp trong thực nghiệm: biến thể dùng sai số
+        tuyệt đối đạt WAPE tốt nhất nhưng dự báo thiếu 14%, nên không được
+        khuyến nghị.
+        """
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from src.experiment import _recommend_model
+        import tempfile
+
+        results = pd.DataFrame([
+            # WAPE tốt nhất nhưng lệch nặng -> phải bị loại
+            {"model": "Single-Stage[absolute]", "feature_set": "full",
+             "wape": 0.4914, "rmse": 16.01, "rmsse": 0.7124,
+             "bias_ratio": 0.8586},
+            # cân bằng và tốt trên RMSE -> phải được chọn
+            {"model": "Two-Stage[gamma]", "feature_set": "full",
+             "wape": 0.5022, "rmse": 15.69, "rmsse": 0.6992,
+             "bias_ratio": 0.9838},
+            {"model": "Single-Stage", "feature_set": "full",
+             "wape": 0.5067, "rmse": 15.72, "rmsse": 0.7017,
+             "bias_ratio": 0.9820},
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            got = _recommend_model(results, Path(d), gap=0)
+        assert got == "Two-Stage[gamma]"
+
+    def test_falls_back_when_nothing_balanced(self):
+        import tempfile
+        from pathlib import Path
+        from src.experiment import _recommend_model
+
+        results = pd.DataFrame([
+            {"model": "A", "feature_set": "full", "wape": 0.5,
+             "rmse": 10.0, "rmsse": 0.7, "bias_ratio": 0.5},
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            assert _recommend_model(results, Path(d), gap=0) == ""

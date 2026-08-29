@@ -44,6 +44,10 @@ python -m src.experiment --gap 0 --quick
 python -m src.experiment --gap 0
 python -m src.experiment --gap 7
 
+# 5. Dựng lại bảng tổng hợp từ checkpoint, KHÔNG huấn luyện lại
+#    Dùng khi thay đổi cách trình bày hoặc tiêu chí chọn mô hình
+python -m src.experiment --summarize-only
+
 # Kiểm thử
 pytest tests/ -v
 ```
