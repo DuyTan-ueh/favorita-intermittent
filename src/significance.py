@@ -207,6 +207,48 @@ def holm_correction(p_values: list[float], alpha: float = 0.05) -> list[bool]:
 # --------------------------------------------------------------------------- #
 # Điều phối
 # --------------------------------------------------------------------------- #
+def compare_by_pattern(losses: pd.DataFrame, series_meta: pd.DataFrame,
+                       model_a: str, model_b: str,
+                       loss_col: str = "mae") -> pd.DataFrame:
+    """Kiểm định ghép cặp riêng trong TỪNG nhóm mẫu nhu cầu.
+
+    Bảng phân tầng của câu hỏi nghiên cứu thứ ba chỉ đưa ra chênh lệch trung
+    bình theo nhóm. Với biên độ vài phần nghìn, con số đó chưa đủ để khẳng
+    định điều gì: cần biết chênh lệch có nhất quán trong nội bộ nhóm hay chỉ
+    là dao động ngẫu nhiên.
+
+    Hàm này thực hiện kiểm định ghép cặp riêng biệt trong từng nhóm, rồi hiệu
+    chỉnh cho việc so sánh bốn nhóm cùng lúc. Kết quả trả lời được câu hỏi cụ
+    thể mà phản biện sẽ đặt ra: kiến trúc hai giai đoạn thắng ở nhóm nào một
+    cách đáng tin, và ở nhóm nào chênh lệch chỉ là nhiễu.
+    """
+    pooled = (losses.groupby(["model_key"] + KEYS, as_index=False)
+              .agg(**{loss_col: (loss_col, "mean")}))
+    meta = series_meta[KEYS + ["pattern"]].drop_duplicates()
+    pooled = pooled.merge(meta, on=KEYS, how="left")
+
+    rows = []
+    for pattern, grp in pooled.groupby("pattern", sort=False):
+        if pd.isna(pattern):
+            continue
+        res = paired_test_by_series(grp, model_a, model_b, loss_col)
+        res["pattern"] = pattern
+        rows.append(res)
+
+    out = pd.DataFrame(rows)
+    if not len(out):
+        return out
+
+    # Bốn nhóm được kiểm định cùng lúc nên xác suất có ít nhất một kết luận
+    # sai tăng lên; hiệu chỉnh Holm đưa nó về mức kiểm soát được.
+    out["reject_holm"] = holm_correction(out.p_wilcoxon.fillna(1.0).tolist())
+    out["ý_nghĩa"] = np.where(out.reject_holm, "có", "không")
+
+    order = ["Smooth", "Erratic", "Intermittent", "Lumpy"]
+    out["_o"] = out.pattern.map({p: i for i, p in enumerate(order)})
+    return out.sort_values("_o").drop(columns="_o").reset_index(drop=True)
+
+
 def per_series_losses(pred: pd.DataFrame, model_key: str,
                       fold: int) -> pd.DataFrame:
     """Tổng hợp sai số theo từng chuỗi, phục vụ kiểm định ghép cặp.

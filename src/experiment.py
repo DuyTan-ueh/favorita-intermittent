@@ -289,7 +289,8 @@ def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
 
     _summarise(results, strat, out_dir, gap)
     if losses is not None:
-        _run_significance(losses, results, out_dir, gap)
+        _run_significance(losses, results, out_dir, gap, series,
+                          getattr(_summarise, "best_pair", None))
     return results
 
 
@@ -563,6 +564,7 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
         pivot["Two−Single"] = (pivot[b] - pivot[a]).round(4)
         pivot["Two thắng?"] = np.where(pivot["Two−Single"] < 0, "có", "không")
 
+    _summarise.best_pair = (best.get("Single-Stage"), best.get("Two-Stage"))
     ref_model = best.get("Two-Stage", "Two-Stage")
     info = (full[full.model == ref_model]
             .groupby("pattern")[["n_series", "zero_rate"]].mean().round(4))
@@ -579,7 +581,9 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
 
 
 def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
-                      out_dir: Path, gap: int) -> None:
+                      out_dir: Path, gap: int,
+                      series: pd.DataFrame | None = None,
+                      best_pair: tuple | None = None) -> None:
     """Kiểm định xem chênh lệch giữa các mô hình có ý nghĩa thống kê không.
 
     Chênh lệch WAPE trong nghiên cứu này chỉ vào khoảng vài phần nghìn. Một
@@ -640,6 +644,38 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
                   f"({r['độ_lớn']})")
             print(f"      kết luận             : {r['verdict']}")
         pd.DataFrame(rows).to_csv(out_dir / "significance_rq1.csv", index=False)
+
+    # ---- Kiểm định riêng trong từng nhóm mẫu nhu cầu (RQ3) ----
+    if series is not None and best_pair and all(best_pair):
+        a_model, b_model = best_pair
+        a_key, b_key = f"{a_model}|full", f"{b_model}|full"
+        keys = set(losses.model_key)
+        if a_key in keys and b_key in keys:
+            print("\n" + "-" * 72)
+            print("  RQ3 — kiểm định riêng trong từng nhóm mẫu nhu cầu")
+            print(f"  {a_key}  vs  {b_key}")
+            print("-" * 72)
+
+            by_pat = significance.compare_by_pattern(
+                losses, series, a_key, b_key)
+            if len(by_pat):
+                show = by_pat[["pattern", "n_series", "mean_diff",
+                               "b_win_rate", "p_wilcoxon", "cohen_d",
+                               "độ_lớn", "ý_nghĩa"]].rename(columns={
+                    "mean_diff": "chênh_MAE", "b_win_rate": "tỷ_lệ_thắng"})
+                print(show.round(5).to_string(index=False))
+                print("\n  chênh_MAE dương nghĩa là khung hai giai đoạn tốt "
+                      "hơn trong nhóm đó.")
+                print("  tỷ_lệ_thắng là tỷ lệ chuỗi mà khung hai giai đoạn "
+                      "thắng.")
+                print("  Cột ý_nghĩa đã hiệu chỉnh Holm cho bốn nhóm.")
+
+                won = by_pat[(by_pat.mean_diff > 0) & by_pat.reject_holm]
+                print(f"\n  Khung hai giai đoạn thắng có ý nghĩa ở "
+                      f"{len(won)}/{len(by_pat)} nhóm"
+                      + (f": {', '.join(won.pattern)}" if len(won) else ""))
+                by_pat.to_csv(out_dir / "significance_rq3_by_pattern.csv",
+                              index=False)
 
     print(f"\n  Đã lưu kết quả kiểm định vào {out_dir}")
 

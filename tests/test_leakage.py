@@ -679,3 +679,66 @@ class TestModelRecommendation:
         ])
         with tempfile.TemporaryDirectory() as d:
             assert _recommend_model(results, Path(d), gap=0) == ""
+
+
+class TestPatternSignificance:
+    @staticmethod
+    def _make(n_per_pattern=800, seed=0):
+        """Dựng dữ liệu có hiệu ứng KHÁC NHAU giữa các nhóm.
+
+        Nhóm Smooth có chênh lệch rõ, nhóm Lumpy gần như không có. Kiểm định
+        phải phân biệt được hai tình huống này thay vì kết luận giống nhau cho
+        cả bốn nhóm.
+        """
+        rng = np.random.default_rng(seed)
+        effects = {"Smooth": 0.30, "Erratic": 0.20,
+                   "Intermittent": 0.05, "Lumpy": 0.0}
+        losses, meta, item = [], [], 0
+        for pat, eff in effects.items():
+            ids = np.arange(item, item + n_per_pattern)
+            item += n_per_pattern
+            base = rng.gamma(2, 1, n_per_pattern)
+            meta.append(pd.DataFrame({"store_nbr": 1, "item_nbr": ids,
+                                      "pattern": pat}))
+            losses.append(pd.DataFrame({
+                "store_nbr": 1, "item_nbr": ids, "model_key": "A|full",
+                "mae": base + eff + rng.normal(0, 0.3, n_per_pattern)}))
+            losses.append(pd.DataFrame({
+                "store_nbr": 1, "item_nbr": ids, "model_key": "B|full",
+                "mae": base}))
+        return pd.concat(losses, ignore_index=True), pd.concat(meta,
+                                                               ignore_index=True)
+
+    def test_detects_per_pattern_differences(self):
+        from src.significance import compare_by_pattern
+        losses, meta = self._make()
+        out = compare_by_pattern(losses, meta, "A|full", "B|full")
+
+        assert len(out) == 4
+        assert list(out.pattern) == ["Smooth", "Erratic",
+                                     "Intermittent", "Lumpy"]
+
+        res = out.set_index("pattern")
+        # nhóm có hiệu ứng lớn phải đạt ý nghĩa
+        assert res.loc["Smooth", "ý_nghĩa"] == "có"
+        # nhóm không có hiệu ứng thì không được kết luận có
+        assert res.loc["Lumpy", "ý_nghĩa"] == "không"
+        # độ lớn hiệu ứng phải giảm dần đúng theo thiết kế
+        assert (res.loc["Smooth", "cohen_d"]
+                > res.loc["Intermittent", "cohen_d"])
+
+    def test_holm_applied_across_patterns(self):
+        """Hiệu chỉnh phải áp cho cả bốn nhóm, không phải từng nhóm riêng."""
+        from src.significance import compare_by_pattern
+        losses, meta = self._make()
+        out = compare_by_pattern(losses, meta, "A|full", "B|full")
+        assert "reject_holm" in out.columns
+        # số kết luận sau hiệu chỉnh không được nhiều hơn số p < 0.05
+        assert out.reject_holm.sum() <= (out.p_wilcoxon < 0.05).sum()
+
+    def test_missing_model_returns_empty(self):
+        from src.significance import compare_by_pattern
+        losses, meta = self._make(n_per_pattern=50)
+        out = compare_by_pattern(losses, meta, "A|full", "không_có|full")
+        assert all(out.n_series == 0) or all(
+            out.verdict == "không đủ chuỗi")
