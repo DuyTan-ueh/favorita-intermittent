@@ -249,6 +249,90 @@ def compare_by_pattern(losses: pd.DataFrame, series_meta: pd.DataFrame,
     return out.sort_values("_o").drop(columns="_o").reset_index(drop=True)
 
 
+# --------------------------------------------------------------------------- #
+# Độ ổn định qua nhiều seed
+# --------------------------------------------------------------------------- #
+# Quy tắc quyết định được khai báo Ở ĐÂY, trước khi biết kết quả thật. Mục đích
+# là ngăn việc diễn giải "vững" hay "chỉ là gợi ý" bị chọn sau khi đã nhìn thấy
+# số liệu — một dạng thiên lệch xác nhận rất dễ mắc phải khi tự đánh giá công
+# trình của chính mình.
+#
+# Quy tắc tính theo TỶ LỆ seed đồng thuận, không theo số tuyệt đối — vì 3/3 seed
+# đồng thuận là bằng chứng mạnh hơn 3/5, dù cùng "ba seed thắng". Số seed tối
+# thiểu để một tỷ lệ có ý nghĩa là 3; dưới mức đó không đủ để kết luận gì.
+def _seed_verdict(consistent: int, n: int) -> str:
+    if n < 3:
+        return "không đủ seed để kết luận (cần tối thiểu 3)"
+    frac = consistent / n
+    if frac == 1.0:
+        return "vững — trình bày như phát hiện chính của bài"
+    if frac >= 0.8:
+        return "gợi ý mạnh — diễn đạt thận trọng, nêu rõ seed đảo chiều"
+    if frac >= 0.6:
+        return "gợi ý yếu — chỉ nêu trong Discussion, không đưa vào Kết luận"
+    return "không đủ bằng chứng — coi chiều thắng là ngẫu nhiên"
+
+
+def seed_stability_table(results: pd.DataFrame, model_a: str, model_b: str,
+                         feature_set: str = "full",
+                         metric: str = "wape") -> pd.DataFrame:
+    """Bảng chi tiết từng seed, không chỉ trung bình.
+
+    Chỉ nhìn trung bình và độ lệch chuẩn có thể che giấu một seed lệch hẳn: bốn
+    seed gần nhau cộng một seed ngoại lệ vẫn cho ra độ lệch chuẩn trông chấp
+    nhận được. Bảng liệt kê từng seed để phát hiện trường hợp đó, và để người
+    đọc tự kiểm tra thay vì tin vào một con số tổng hợp duy nhất.
+
+    Cột quan trọng nhất là ``delta``: đây là đại lượng cần so sánh với độ lệch
+    chuẩn giữa các seed để trả lời câu hỏi trung tâm — chênh lệch giữa hai mô
+    hình có vượt qua nhiễu ngẫu nhiên của quá trình huấn luyện hay không.
+    """
+    sub = results[results.feature_set == feature_set]
+    a = sub[sub.model == model_a].groupby("seed")[metric].mean()
+    b = sub[sub.model == model_b].groupby("seed")[metric].mean()
+
+    out = pd.DataFrame({model_a: a, model_b: b}).dropna()
+    if not len(out):
+        return out
+
+    out["delta"] = out[model_a] - out[model_b]
+    out[f"{model_b}_thắng"] = out["delta"] > 0
+    return out.reset_index()
+
+
+def summarise_seed_stability(table: pd.DataFrame, model_a: str,
+                             model_b: str) -> dict:
+    """Tóm tắt bảng độ ổn định thành một quyết định theo quy tắc đã khai báo.
+
+    Trả về cả số liệu lẫn nhãn quyết định, để in ra cùng lúc và không thể tách
+    số liệu khỏi diễn giải — tránh tình huống chọn cách diễn đạt sau khi đã
+    thấy con số.
+    """
+    if not len(table):
+        return {"n_seeds": 0, "n_wins": 0, "verdict": "không có dữ liệu"}
+
+    win_col = f"{model_b}_thắng"
+    n = len(table)
+    wins = int(table[win_col].sum())
+    delta_mean = float(table.delta.mean())
+    delta_std = float(table.delta.std(ddof=1)) if n > 1 else float("nan")
+    ratio = (abs(delta_mean) / delta_std) if delta_std and delta_std > 1e-9 \
+        else float("inf")
+
+    # Quy tắc áp cho phía có nhiều seed thắng hơn — 5/5 và 0/5 cùng mức "vững",
+    # chỉ khác chiều thắng.
+    consistent_side = max(wins, n - wins)
+
+    return {
+        "n_seeds": n,
+        "n_wins_b": wins,
+        "delta_mean": delta_mean,
+        "delta_std": delta_std,
+        "delta_over_std": ratio,
+        "verdict": _seed_verdict(consistent_side, n),
+    }
+
+
 def per_series_losses(pred: pd.DataFrame, model_key: str,
                       fold: int) -> pd.DataFrame:
     """Tổng hợp sai số theo từng chuỗi, phục vụ kiểm định ghép cặp.

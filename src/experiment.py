@@ -83,15 +83,17 @@ def prepare_matrix(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
 
 def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
              specs: pd.DataFrame, cfg: Config, series: pd.DataFrame,
-             device: str = "cpu",
-             run_baselines: bool = True) -> tuple[list[dict], list[pd.DataFrame]]:
-    """Huấn luyện và đánh giá toàn bộ mô hình trên một fold.
+             device: str = "cpu", seed: int | None = None,
+             run_baselines: bool = True) -> tuple[list[dict], list[pd.DataFrame], list]:
+    """Huấn luyện và đánh giá toàn bộ mô hình trên một fold, tại một seed.
 
-    Trả về hai thứ tách bạch: bảng chỉ số tổng hợp, và bảng chỉ số phân tầng
-    theo nhóm mẫu nhu cầu. Bảng thứ hai được lập cho CẢ Single-Stage lẫn
-    Two-Stage, vì RQ3 hỏi khung hai giai đoạn có tốt hơn ở nhóm nào — muốn
-    trả lời thì phải so hai mô hình trong cùng một nhóm, chứ một mình con số
-    của Two-Stage không nói lên điều gì.
+    Tham số ``seed`` điều khiển tính ngẫu nhiên của XGBoost (``subsample`` và
+    ``colsample_bytree`` đều nhỏ hơn 1). Baseline cổ điển không có tính ngẫu
+    nhiên nên tham số này không ảnh hưởng tới chúng — gọi hàm với
+    ``run_baselines=False`` ở các seed sau seed đầu để tránh tính lại vô ích.
+
+    Trả về ba thứ tách bạch: bảng chỉ số tổng hợp, bảng chỉ số phân tầng theo
+    nhóm mẫu nhu cầu, và danh sách sai số theo từng chuỗi.
     """
     exp = cfg.raw.get("experiment", {})
     n_est = exp.get("n_estimators", 300)
@@ -100,17 +102,19 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
     s1_list = exp.get("single_stage_objectives") or ["tweedie"]
     shift = bool(exp.get("stage2_shift", False))
     save_losses = bool(exp.get("save_series_losses", True))
+    seed = cfg.seed if seed is None else seed
 
     train = df[df.date <= fold["train_end"]]
     test = df[(df.date >= fold["test_start"]) & (df.date <= fold["test_end"])]
 
-    print(f"\n  fold {fold['fold']} | train {len(train):,} dòng "
+    print(f"\n  fold {fold['fold']} seed {seed} | train {len(train):,} dòng "
           f"(tới {fold['train_end'].date()}) | test {len(test):,} dòng")
 
     scales = metrics.compute_scales(train)
     results, strat_frames, loss_frames = [], [], []
 
     # ---- Baseline cổ điển (RQ1) ----
+    # Không có tính ngẫu nhiên nên chỉ cần tính một lần, không phụ thuộc seed.
     if run_baselines:
         for variant, label in [("classic", "Croston"), ("sba", "SBA"),
                                ("tsb", "TSB")]:
@@ -119,13 +123,14 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
             res = metrics.evaluate_forecast(pred, scales)
             res.update({"model": label, "feature_set": "-",
                         "fold": fold["fold"], "gap": fold["gap_days"],
+                        "seed": seed,
                         "seconds": round(time.time() - t0, 1)})
             results.append(res)
 
             # baseline cũng cần phân tầng để làm mốc so sánh trong RQ3
             s = metrics.evaluate_by_pattern(pred, series)
             s = s.assign(model=label, feature_set="-",
-                         fold=fold["fold"], gap=fold["gap_days"])
+                         fold=fold["fold"], gap=fold["gap_days"], seed=seed)
             strat_frames.append(s)
             if save_losses:
                 loss_frames.append(significance.per_series_losses(
@@ -172,7 +177,7 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
 
         for label, fn, extra, tag in variants:
             t0 = time.time()
-            pred, _ = fn(train, test, cols, seed=cfg.seed,
+            pred, _ = fn(train, test, cols, seed=seed,
                          n_estimators=n_est, device=device, **extra)
             res = metrics.evaluate_forecast(pred, scales)
 
@@ -184,14 +189,14 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
             res.update({
                 "model": tag, "arch": label, "feature_set": set_name,
                 "loss": extra.get("stage2") or extra.get("objective"),
-                "fold": fold["fold"], "gap": fold["gap_days"],
+                "fold": fold["fold"], "gap": fold["gap_days"], "seed": seed,
                 "n_features": len(cols), "device": device,
                 "seconds": round(time.time() - t0, 1)})
             results.append(res)
 
             s = metrics.evaluate_by_pattern(pred, series)
             s = s.assign(model=tag, arch=label, feature_set=set_name,
-                         fold=fold["fold"], gap=fold["gap_days"])
+                         fold=fold["fold"], gap=fold["gap_days"], seed=seed)
             strat_frames.append(s)
 
             if save_losses:
@@ -226,46 +231,58 @@ def run_experiment(cfg: Config, gap: int, max_parts: int | None = None,
     device = models.resolve_device(
         cfg.raw.get("experiment", {}).get("device", "auto"))
 
+    seeds = cfg.raw.get("run", {}).get("seeds") or [cfg.seed]
+    if len(seeds) > 1:
+        print(f"  Chạy đa seed: {seeds}")
+
     if quick:
         folds = folds[-1:]
         print("  [chế độ nhanh] chỉ chạy fold cuối")
 
-    # Bỏ qua những fold đã hoàn tất ở lần chạy trước. Việc này quan trọng vì
-    # một lượt chạy đầy đủ mất nhiều giờ và phiên làm việc có thể bị ngắt.
+    # Bỏ qua những tổ hợp (fold, seed) đã hoàn tất ở lần chạy trước. Việc này
+    # quan trọng vì một lượt chạy đầy đủ mất nhiều giờ và phiên làm việc có
+    # thể bị ngắt.
     todo = []
     for f in folds:
-        done = ckpt_dir / f"fold{f['fold']}_metrics.csv"
-        if use_ckpt and done.exists():
-            print(f"  [bỏ qua] fold {f['fold']} đã có kết quả từ lần chạy trước")
-        else:
-            todo.append(f)
+        for s in seeds:
+            done = ckpt_dir / f"fold{f['fold']}_seed{s}_metrics.csv"
+            if use_ckpt and done.exists():
+                print(f"  [bỏ qua] fold {f['fold']} seed {s} đã có kết quả")
+            else:
+                todo.append((f, s))
 
     if summarize_only:
         if todo:
             raise RuntimeError(
-                f"Còn {len(todo)} fold chưa có checkpoint, không thể chỉ "
-                f"tổng hợp. Bỏ cờ --summarize-only để chạy chúng.")
+                f"Còn {len(todo)} tổ hợp (fold, seed) chưa có checkpoint, "
+                f"không thể chỉ tổng hợp. Bỏ cờ --summarize-only để chạy chúng.")
         print("  [chỉ tổng hợp] dùng lại checkpoint, không huấn luyện lại")
         todo = []
     elif todo:
         df = load_features(cfg, max_parts)
         df, feature_cols = prepare_matrix(df)
     else:
-        print("  Mọi fold đã hoàn tất, chỉ tổng hợp lại kết quả")
+        print("  Mọi tổ hợp đã hoàn tất, chỉ tổng hợp lại kết quả")
 
-    for fold in todo:
+    for fold, seed in todo:
+        # Baseline cổ điển không có tính ngẫu nhiên: chỉ tính ở seed đầu tiên
+        # trong danh sách, tránh lặp lại vô ích cho các seed sau.
+        run_baselines = (seed == seeds[0])
         res, strat, losses = run_fold(df, fold, feature_cols, specs, cfg,
-                                      series, device=device)
+                                      series, device=device, seed=seed,
+                                      run_baselines=run_baselines)
         if use_ckpt:
             pd.DataFrame(res).to_csv(
-                ckpt_dir / f"fold{fold['fold']}_metrics.csv", index=False)
+                ckpt_dir / f"fold{fold['fold']}_seed{seed}_metrics.csv",
+                index=False)
             pd.concat(strat, ignore_index=True).to_csv(
-                ckpt_dir / f"fold{fold['fold']}_pattern.csv", index=False)
+                ckpt_dir / f"fold{fold['fold']}_seed{seed}_pattern.csv",
+                index=False)
             if losses:
                 pd.concat(losses, ignore_index=True).to_parquet(
-                    ckpt_dir / f"fold{fold['fold']}_losses.parquet",
+                    ckpt_dir / f"fold{fold['fold']}_seed{seed}_losses.parquet",
                     index=False)
-            print(f"  [đã lưu] checkpoint fold {fold['fold']}")
+            print(f"  [đã lưu] checkpoint fold {fold['fold']} seed {seed}")
         gc.collect()
 
     # Gộp toàn bộ checkpoint lại, kể cả của những lần chạy trước
@@ -467,6 +484,51 @@ def _recommend_model(results: pd.DataFrame, out_dir: Path,
     return str(best.model)
 
 
+def _seed_stability(results: pd.DataFrame, out_dir: Path, gap: int) -> None:
+    """In bảng chi tiết từng seed cho cặp mô hình trung tâm của RQ1.
+
+    Chỉ in khi kết quả có nhiều hơn 1 seed — với thực nghiệm chạy 1 seed, bảng
+    này không có ý nghĩa và không nên xuất hiện.
+    """
+    if "seed" not in results.columns or results.seed.nunique() < 2:
+        return
+
+    _banner(f"ĐỘ ỔN ĐỊNH QUA SEED (gap={gap})")
+
+    pairs = [
+        ("Single-Stage", "Two-Stage[gamma]", "Câu hỏi trung tâm RQ1"),
+        ("Single-Stage", "Two-Stage", "Đối chứng: cùng hàm mất mát squared"),
+        ("Single-Stage[absolute]", "Two-Stage[absolute]",
+         "Đối chứng: cùng hàm mất mát absolute"),
+    ]
+
+    rows_summary = []
+    for model_a, model_b, label in pairs:
+        tab = significance.seed_stability_table(results, model_a, model_b)
+        if not len(tab):
+            continue
+
+        print(f"\n[{label}]")
+        print(f"  {model_a}  vs  {model_b}")
+        print(tab.round(4).to_string(index=False))
+
+        s = significance.summarise_seed_stability(tab, model_a, model_b)
+        win_col = f"{model_b}_thắng"
+        print(f"\n  {model_b} thắng {s['n_wins_b']}/{s['n_seeds']} seed")
+        print(f"  Δ trung bình     : {s['delta_mean']:+.4f}")
+        print(f"  σ giữa các seed  : {s['delta_std']:.4f}")
+        print(f"  |Δ| / σ          : {s['delta_over_std']:.1f}")
+        print(f"  >>> Kết luận theo quy tắc đã khai báo trước: {s['verdict']}")
+
+        s.update({"model_a": model_a, "model_b": model_b, "label": label})
+        rows_summary.append(s)
+
+    if rows_summary:
+        pd.DataFrame(rows_summary).to_csv(
+            out_dir / "seed_stability.csv", index=False)
+        print(f"\nĐã lưu: {out_dir / 'seed_stability.csv'}")
+
+
 def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
                out_dir: Path, gap: int) -> None:
     """In các bảng tổng hợp tương ứng từng câu hỏi nghiên cứu."""
@@ -482,6 +544,7 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
     _banner(f"RQ1 — SO SÁNH MÔ HÌNH (gap={gap}, trung bình các fold)")
     print(agg.round(4).to_string(index=False))
 
+    _seed_stability(results, out_dir, gap)
     _bias_diagnostics(results, gap)
     _matched_loss_comparison(results, out_dir, gap)
     recommended = _recommend_model(results, out_dir, gap)

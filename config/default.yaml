@@ -5,7 +5,14 @@
 
 run:
   name: "baseline_h7"
+  # seed dùng để lấy mẫu chuỗi (phải cố định — nếu đổi theo mỗi lần chạy thì
+  # mỗi cấu hình sẽ so sánh trên tập chuỗi khác nhau, không còn công bằng).
   seed: 42
+  # Danh sách seed dùng để huấn luyện mô hình học máy, phục vụ kiểm tra độ ổn
+  # định (XGBoost có subsample/colsample_bytree < 1 nên có tính ngẫu nhiên).
+  # Để trống hoặc bỏ dòng này thì chỉ chạy 1 seed (giá trị ở trên).
+  seeds: [42]
+  # seeds: [42, 123, 456, 789, 1024]   # bật dòng này cho Phase A (kiểm tra ổn định)
 
 data:
   # Mốc cắt: onpromotion trống 100% trước ngày này (đã kiểm chứng thực nghiệm)

@@ -742,3 +742,127 @@ class TestPatternSignificance:
         out = compare_by_pattern(losses, meta, "A|full", "không_có|full")
         assert all(out.n_series == 0) or all(
             out.verdict == "không đủ chuỗi")
+
+
+class TestSeedStability:
+    @staticmethod
+    def _make_results(deltas_by_seed, noise=0.0005, seed=0):
+        """Dựng bảng kết quả giả cho nhiều seed, mỗi seed có Δ cho trước."""
+        rng = np.random.default_rng(seed)
+        rows = []
+        for s, delta in deltas_by_seed.items():
+            base = 0.50
+            rows.append({"model": "Two-Stage[gamma]", "feature_set": "full",
+                        "seed": s, "wape": base + rng.normal(0, noise)})
+            rows.append({"model": "Single-Stage", "feature_set": "full",
+                        "seed": s, "wape": base - delta + rng.normal(0, noise)})
+        return pd.DataFrame(rows)
+
+    def test_consistent_win_gives_high_ratio(self):
+        """Δ ổn định qua mọi seed -> tỷ lệ |Δ|/σ phải lớn."""
+        from src.significance import seed_stability_table, summarise_seed_stability
+        res = self._make_results({42: 0.0045, 123: 0.0044, 456: 0.0054,
+                                  789: 0.0055, 1024: 0.0044}, noise=0.0002)
+        tab = seed_stability_table(res, "Two-Stage[gamma]", "Single-Stage")
+        s = summarise_seed_stability(tab, "Two-Stage[gamma]", "Single-Stage")
+        assert s["n_seeds"] == 5
+        assert s["delta_over_std"] > 3
+        assert s["verdict"] == "vững — trình bày như phát hiện chính của bài"
+
+    def test_inconsistent_win_gives_low_ratio_and_weak_verdict(self):
+        """Δ đảo chiều giữa các seed -> không được kết luận vững."""
+        from src.significance import seed_stability_table, summarise_seed_stability
+        res = self._make_results({42: 0.003, 123: -0.004, 456: 0.006,
+                                  789: -0.005, 1024: 0.001}, noise=0.0002)
+        tab = seed_stability_table(res, "Two-Stage[gamma]", "Single-Stage")
+        s = summarise_seed_stability(tab, "Two-Stage[gamma]", "Single-Stage")
+        # thắng 3/5 hoặc 2/5 tuỳ dấu -> verdict phải ở mức yếu, không phải "vững"
+        assert s["verdict"] != "vững — trình bày như phát hiện chính của bài"
+
+    def test_single_seed_returns_no_data_gracefully(self):
+        """Chỉ 1 seed thì bảng độ ổn định không có ý nghĩa, không được lỗi."""
+        from src.significance import seed_stability_table
+        res = self._make_results({42: 0.0045})
+        tab = seed_stability_table(res, "Two-Stage[gamma]", "Single-Stage")
+        assert len(tab) == 1  # vẫn trả về được, chỉ không đủ để kết luận
+
+    def test_missing_model_returns_empty_not_error(self):
+        from src.significance import seed_stability_table
+        res = self._make_results({42: 0.0045, 123: 0.004})
+        tab = seed_stability_table(res, "Không-tồn-tại", "Single-Stage")
+        assert len(tab) == 0
+
+    def test_decision_rule_symmetric_for_either_direction(self):
+        """5/5 và 0/5 (tức đối phương thắng đều) đều phải là 'vững', chỉ khác dấu."""
+        from src.significance import seed_stability_table, summarise_seed_stability
+        # đảo dấu: model_a luôn thắng thay vì model_b
+        res = self._make_results({42: -0.005, 123: -0.006, 456: -0.004,
+                                  789: -0.005, 1024: -0.0045}, noise=0.0002)
+        tab = seed_stability_table(res, "Two-Stage[gamma]", "Single-Stage")
+        s = summarise_seed_stability(tab, "Two-Stage[gamma]", "Single-Stage")
+        assert s["n_wins_b"] == 0
+        assert s["verdict"] == "vững — trình bày như phát hiện chính của bài"
+
+    def test_verdict_scales_with_seed_count_not_absolute_number(self):
+        """Bug đã gặp thật: 3/3 seed (100%) từng bị chấm cùng mức '3/5' (60%).
+
+        Quy tắc phải theo TỶ LỆ, không theo số tuyệt đối khớp với bảng 5-seed
+        cứng — nếu không, chạy thử nhanh với 3 seed sẽ bị đánh giá sai mức độ
+        vững của kết quả.
+        """
+        from src.significance import seed_stability_table, summarise_seed_stability
+        res = self._make_results({42: 0.004, 123: 0.0038, 456: 0.0042},
+                                 noise=0.0001)
+        tab = seed_stability_table(res, "Two-Stage[gamma]", "Single-Stage")
+        s = summarise_seed_stability(tab, "Two-Stage[gamma]", "Single-Stage")
+        assert s["n_seeds"] == 3
+        assert s["n_wins_b"] == 3
+        assert s["verdict"] == "vững — trình bày như phát hiện chính của bài"
+
+    def test_too_few_seeds_refuses_to_conclude(self):
+        from src.significance import seed_stability_table, summarise_seed_stability
+        res = self._make_results({42: 0.004, 123: 0.0038})
+        tab = seed_stability_table(res, "Two-Stage[gamma]", "Single-Stage")
+        s = summarise_seed_stability(tab, "Two-Stage[gamma]", "Single-Stage")
+        assert "không đủ seed" in s["verdict"]
+
+
+class TestMultiSeedWiring:
+    """Kiểm tra seed được truyền đúng xuống mô hình, không bị bỏ sót."""
+
+    def test_run_fold_tags_seed_column(self):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        from src.experiment import run_fold
+        from src.config import Config
+
+        cfg = make_cfg(horizon=7, lags=[7], windows=[7])
+        cfg.raw["experiment"] = {"n_estimators": 5, "feature_sets": ["historical"],
+                                 "single_stage_objectives": ["squared"],
+                                 "stage2_objectives": ["squared"],
+                                 "save_series_losses": False}
+
+        g = make_grid(n_series=2, n_days=80)
+        g = add_lag_features(g, cfg)
+        g = add_rolling_features(g, cfg)
+        g = add_intermittency_features(g, cfg)
+        g["y_occurrence"] = (g.y > 0).astype("int8")
+        g["y_magnitude"] = g.y.where(g.y > 0)
+
+        feature_cols = [c for c in g.columns
+                       if c not in ("y", "y_occurrence", "y_magnitude", "date",
+                                    "store_nbr", "item_nbr", "onpromotion")]
+        specs = pd.DataFrame([{"feature": c, "group": "lag"} for c in feature_cols])
+        uniq = g[["store_nbr", "item_nbr"]].drop_duplicates()
+        series = uniq.assign(pattern="Smooth")
+
+        fold = {"fold": 0, "gap_days": 0,
+               "train_end": g.date.max() - pd.Timedelta(days=20),
+               "test_start": g.date.max() - pd.Timedelta(days=13),
+               "test_end": g.date.max()}
+
+        res, strat, losses = run_fold(g, fold, feature_cols, specs, cfg,
+                                      series, seed=999, run_baselines=False)
+        assert all(r["seed"] == 999 for r in res)
+        assert all((s.seed == 999).all() for s in strat)
