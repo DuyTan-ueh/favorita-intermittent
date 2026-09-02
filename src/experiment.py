@@ -101,6 +101,7 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
     s2_list = exp.get("stage2_objectives") or ["squared"]
     s1_list = exp.get("single_stage_objectives") or ["tweedie"]
     shift = bool(exp.get("stage2_shift", False))
+    xgb_overrides = exp.get("xgb_params") or None
     save_losses = bool(exp.get("save_series_losses", True))
     seed = cfg.seed if seed is None else seed
 
@@ -178,7 +179,8 @@ def run_fold(df: pd.DataFrame, fold: dict, feature_cols: list[str],
         for label, fn, extra, tag in variants:
             t0 = time.time()
             pred, _ = fn(train, test, cols, seed=seed,
-                         n_estimators=n_est, device=device, **extra)
+                         n_estimators=n_est, device=device,
+                         xgb_overrides=xgb_overrides, **extra)
             res = metrics.evaluate_forecast(pred, scales)
 
             if label == "Two-Stage":
@@ -368,16 +370,33 @@ def _bias_diagnostics(results: pd.DataFrame, gap: int) -> None:
 
 def _matched_loss_comparison(results: pd.DataFrame, out_dir: Path,
                              gap: int) -> None:
-    """So sánh kiến trúc trong điều kiện hàm mất mát tương đương.
+    """So sánh kiến trúc theo hai mức độ khớp hàm mất mát, tách biệt rõ ràng.
 
     So một mô hình huấn luyện bằng sai số tuyệt đối với một mô hình huấn luyện
     bằng Tweedie, rồi đánh giá bằng WAPE, là phép so lệch: chỉ số đánh giá dựa
     trên sai số tuyệt đối nên đương nhiên ưu ái mô hình đã tối ưu đúng đại
-    lượng đó. Phần chênh lệch quan sát được khi ấy phản ánh lựa chọn hàm mất
-    mát chứ không phải ưu thế của kiến trúc.
+    lượng đó.
 
-    Bảng dưới ghép cặp các cấu hình dùng cùng họ hàm mất mát, để chênh lệch
-    còn lại quy được cho kiến trúc.
+    Có hai mức độ "khớp" cần phân biệt rạch ròi, không được gộp chung:
+
+      Khớp chính xác (exact match)
+          Hai kiến trúc dùng ĐÚNG cùng một hàm mất mát
+          (``squared`` với ``squared``, ``absolute`` với ``absolute``).
+          Đây là so sánh sạch nhất: mọi chênh lệch quan sát được chỉ có thể
+          đến từ kiến trúc, không thể đến từ hàm mất mát.
+
+      Tương đồng phân phối (distributional analogy), KHÔNG phải khớp chính xác
+          Tweedie (Single-Stage) và Gamma (Two-Stage) là hai hàm mất mát
+          KHÁC NHAU — Tweedie có khối xác suất tại không, Gamma yêu cầu mục
+          tiêu dương ngặt và chỉ áp dụng được vì giai đoạn hai đã lọc sẵn
+          y>0. Cả hai chỉ giống nhau ở việc cùng được chọn vì phù hợp với
+          đặc tính lệch phải của phần dữ liệu chúng xử lý. So sánh cặp này
+          trả lời một câu hỏi khác: "khi mỗi kiến trúc dùng hàm mất mát phù
+          hợp nhất với phần dữ liệu nó xử lý, kiến trúc nào tốt hơn?" —
+          không phải "kiến trúc nào tốt hơn khi hàm mất mát giống hệt nhau?"
+
+    Gộp hai câu hỏi này vào một bảng, hoặc gọi cả hai là "matched loss", sẽ
+    khiến người đọc hiểu nhầm mức độ chặt chẽ của so sánh.
     """
     if "arch" not in results.columns or "loss" not in results.columns:
         return
@@ -386,40 +405,43 @@ def _matched_loss_comparison(results: pd.DataFrame, out_dir: Path,
     if not len(full):
         return
 
-    _banner(f"SO SÁNH KHỚP HÀM MẤT MÁT (gap={gap})")
+    _banner(f"SO SÁNH THEO MỨC ĐỘ KHỚP HÀM MẤT MÁT (gap={gap})")
 
-    # Nhóm theo họ hàm mất mát: L1 đánh giá bằng WAPE/MAE, L2 bằng RMSE
-    families = {
-        "L1 (đánh giá bằng WAPE/MAE)": (["absolute"], "wape"),
-        "L2 (đánh giá bằng RMSE)": (["squared", "tweedie", "gamma"], "rmse"),
-    }
+    def _show(label: str, sub: pd.DataFrame, metric: str) -> dict | None:
+        if not len(sub):
+            return None
+        agg = (sub.groupby(["arch", "loss"], as_index=False)
+               .agg(**{metric: (metric, "mean")}, bias=("bias_ratio", "mean"))
+               .sort_values(metric))
+        print(f"\n[{label}]")
+        print(agg.round(4).to_string(index=False))
+        return {"category": label, "metric": metric,
+               "best_arch": agg.iloc[0]["arch"],
+               "best_loss": agg.iloc[0]["loss"],
+               "best_value": float(agg.iloc[0][metric])}
 
     rows = []
-    for fam, (losses, metric) in families.items():
-        sub = full[full.loss.isin(losses)]
-        if not len(sub):
-            continue
-        agg = (sub.groupby(["arch", "loss"], as_index=False)
-               .agg(**{metric: (metric, "mean"),
-                       "bias": ("bias_ratio", "mean")})
-               .sort_values(metric))
-        print(f"\n[{fam}]")
-        print(agg.round(4).to_string(index=False))
-
-        best_arch = agg.iloc[0]["arch"]
-        rows.append({"family": fam, "metric": metric,
-                     "best_arch": best_arch,
-                     "best_loss": agg.iloc[0]["loss"],
-                     "best_value": float(agg.iloc[0][metric])})
+    r = _show("KHỚP CHÍNH XÁC — squared vs squared",
+              full[(full.loss == "squared")], "wape")
+    if r:
+        rows.append(r)
+    r = _show("KHỚP CHÍNH XÁC — absolute vs absolute",
+              full[(full.loss == "absolute")], "wape")
+    if r:
+        rows.append(r)
+    r = _show("TƯƠNG ĐỒNG PHÂN PHỐI (không phải khớp chính xác) — "
+              "Tweedie (Single) vs Gamma (Two)",
+              full[full.loss.isin(["tweedie", "gamma"])], "rmse")
+    if r:
+        rows.append(r)
 
     if rows:
-        summary = pd.DataFrame(rows)
-        summary.to_csv(out_dir / "matched_loss_comparison.csv", index=False)
-        print("\n  Chỉ khi hai kiến trúc dùng cùng họ hàm mất mát thì chênh "
-              "lệch mới\n  quy được cho kiến trúc. Đối chiếu kết luận giữa "
-              "hai họ: nếu cùng một\n  kiến trúc thắng ở cả hai, kết luận "
-              "vững; nếu khác nhau, ưu thế phụ\n  thuộc chỉ số và phải nói rõ "
-              "điều đó.")
+        pd.DataFrame(rows).to_csv(
+            out_dir / "matched_loss_comparison.csv", index=False)
+        print("\n  Chỉ hai bảng 'KHỚP CHÍNH XÁC' mới cho phép quy chênh lệch")
+        print("  hoàn toàn cho kiến trúc. Bảng 'TƯƠNG ĐỒNG PHÂN PHỐI' trả lời")
+        print("  một câu hỏi khác (đã nêu trong docstring) và không nên gọi")
+        print("  là 'matched loss' trong bài viết.")
 
 
 def _recommend_model(results: pd.DataFrame, out_dir: Path,
@@ -485,7 +507,13 @@ def _recommend_model(results: pd.DataFrame, out_dir: Path,
 
 
 def _seed_stability(results: pd.DataFrame, out_dir: Path, gap: int) -> None:
-    """In bảng chi tiết từng seed cho cặp mô hình trung tâm của RQ1.
+    """In bảng chi tiết từng seed, ưu tiên các cặp khớp chính xác hàm mất mát.
+
+    Thứ tự ưu tiên ở đây PHẢI khớp với cách phân loại đã dùng ở
+    ``_matched_loss_comparison`` và ``_run_significance``: cặp khớp chính xác
+    (cùng hàm mất mát) là phép so sánh kiến trúc sạch nhất nên đặt lên đầu;
+    cặp Tweedie/Gamma chỉ là tương đồng phân phối, đặt sau và gắn nhãn rõ để
+    không bị hiểu nhầm là "câu hỏi trung tâm" của RQ1.
 
     Chỉ in khi kết quả có nhiều hơn 1 seed — với thực nghiệm chạy 1 seed, bảng
     này không có ý nghĩa và không nên xuất hiện.
@@ -495,11 +523,17 @@ def _seed_stability(results: pd.DataFrame, out_dir: Path, gap: int) -> None:
 
     _banner(f"ĐỘ ỔN ĐỊNH QUA SEED (gap={gap})")
 
+    # "Single-Stage" mặc định dùng Tweedie, "Two-Stage" mặc định dùng
+    # squared — hai nhãn ngắn này KHÔNG cùng hàm mất mát, nên không được ghép
+    # với nhãn "cùng hàm mất mát squared" như bản trước đã làm sai. Cặp khớp
+    # chính xác squared-squared phải dùng "Single-Stage[squared]".
     pairs = [
-        ("Single-Stage", "Two-Stage[gamma]", "Câu hỏi trung tâm RQ1"),
-        ("Single-Stage", "Two-Stage", "Đối chứng: cùng hàm mất mát squared"),
+        ("Single-Stage[squared]", "Two-Stage",
+         "Khớp chính xác — cùng hàm mất mát squared"),
         ("Single-Stage[absolute]", "Two-Stage[absolute]",
-         "Đối chứng: cùng hàm mất mát absolute"),
+         "Khớp chính xác — cùng hàm mất mát absolute"),
+        ("Single-Stage", "Two-Stage[gamma]",
+         "Tương đồng phân phối (Tweedie≠Gamma) — không phải khớp chính xác"),
     ]
 
     rows_summary = []
@@ -587,6 +621,10 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
         return
 
     _banner(f"RQ3 — HIỆU QUẢ THEO NHÓM MẪU NHU CẦU (gap={gap})")
+    print("  [Lưu ý] Đây là phân tích phân nhóm hồi cứu: nhãn Smooth/Erratic/"
+          "Intermittent/Lumpy\n  được tính trên toàn bộ cửa sổ nghiên cứu, "
+          "không phải thông tin có sẵn tại\n  thời điểm dự báo thực tế của "
+          "từng fold. Không dùng làm đặc trưng đầu vào.")
     full = strat[strat.feature_set.isin(["full", "-"])]
 
     # So sánh biến thể TỐT NHẤT của mỗi kiến trúc, không phải bản mặc định.
@@ -677,36 +715,71 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
     print("\n  Với hai mươi lăm nghìn chuỗi, lực kiểm định cao tới mức gần "
           "như mọi chênh\n  lệch đều đạt ý nghĩa thống kê. Cột độ_lớn mới cho "
           "biết khác biệt có đáng\n  kể trong thực tế hay không.")
+    print("\n  Lưu ý về đơn vị phân tích: các chuỗi không hoàn toàn độc lập —"
+          " nhiều chuỗi\n  chung cửa hàng hoặc cùng giai đoạn thời gian có "
+          "thể tương quan với nhau.\n  Giá trị p ở đây nên được đọc như một "
+          "chỉ báo tương đối, không phải bằng\n  chứng cho N quan sát độc lập"
+          " hoàn toàn. Độ lớn hiệu ứng và tỷ lệ thắng là\n  các chỉ số đáng "
+          "tin cậy hơn để đánh giá mức độ quan trọng thực tế.")
     table.to_csv(out_dir / "significance_vs_best.csv", index=False)
 
     # So sánh trực tiếp cặp quan trọng nhất của RQ1
     pooled = (losses.groupby(["model_key", "store_nbr", "item_nbr"],
                              as_index=False).agg(mae=("mae", "mean")))
-    # Ghép cặp theo hàm mất mát tương đương. So Two-Stage dùng bình phương
-    # sai số với Single-Stage dùng Tweedie là phép so lệch, vì Tweedie vốn
-    # được thiết kế cho dữ liệu có khối xác suất tại không còn bình phương sai
-    # số thì không. Cặp đúng là Gamma cho giai đoạn hai đối với Tweedie cho mô
-    # hình một giai đoạn: cả hai đều là hàm mất mát phù hợp phân phối của
-    # chính bài toán mà chúng giải.
-    pair = [
-        ("Single-Stage|full", "Two-Stage[gamma]|full"),
-        ("Single-Stage[absolute]|full", "Two-Stage[absolute]|full"),
+    # Ba nhóm so sánh, KHÔNG gộp chung một nhãn — mỗi nhóm trả lời một câu
+    # hỏi khác nhau và có độ chặt chẽ khác nhau.
+    exact_match_pairs = [
         ("Single-Stage[squared]|full", "Two-Stage|full"),
+        ("Single-Stage[absolute]|full", "Two-Stage[absolute]|full"),
+    ]
+    analogy_pairs = [
+        ("Single-Stage|full", "Two-Stage[gamma]|full"),
+    ]
+    # Cặp mặc định của mỗi kiến trúc (Tweedie vs squared) — hai hàm mất mát
+    # khác nhau, không thuộc nhóm nào ở trên. Giữ lại vì đây là điểm khởi đầu
+    # đã dẫn tới toàn bộ điều tra về hàm mất mát, nhưng không được gọi là
+    # "khớp" dưới bất kỳ hình thức nào.
+    unmatched_reference_pairs = [
         ("Single-Stage|full", "Two-Stage|full"),
     ]
-    rows = [significance.paired_test_by_series(pooled, a, b) for a, b in pair
-            if a in set(pooled.model_key) and b in set(pooled.model_key)]
-    if rows:
-        print("\n  RQ1 — so sánh ghép cặp theo hàm mất mát tương đương:")
-        for r in rows:
-            print(f"\n    {r['model_a']}\n      vs {r['model_b']}")
-            print(f"      chênh MAE trung bình : {r['mean_diff']:+.5f}")
-            print(f"      tỷ lệ chuỗi B thắng  : {r['b_win_rate']:.1%}")
-            print(f"      p (Wilcoxon)         : {r['p_wilcoxon']:.3e}")
-            print(f"      độ lớn hiệu ứng      : {r['cohen_d']:.4f} "
-                  f"({r['độ_lớn']})")
-            print(f"      kết luận             : {r['verdict']}")
-        pd.DataFrame(rows).to_csv(out_dir / "significance_rq1.csv", index=False)
+
+    def _print_group(label: str, pairs: list) -> list:
+        rows = [significance.paired_test_by_series(pooled, a, b)
+                for a, b in pairs
+                if a in set(pooled.model_key) and b in set(pooled.model_key)]
+        if rows:
+            print(f"\n  [{label}]")
+            for r in rows:
+                print(f"    {r['model_a']}\n      vs {r['model_b']}")
+                print(f"      chênh MAE trung bình : {r['mean_diff']:+.5f}")
+                print(f"      tỷ lệ chuỗi B thắng  : {r['b_win_rate']:.1%}")
+                print(f"      p (Wilcoxon)         : {r['p_wilcoxon']:.3e}")
+                print(f"      độ lớn hiệu ứng      : {r['cohen_d']:.4f} "
+                      f"({r['độ_lớn']})")
+                print(f"      kết luận             : {r['verdict']}")
+        return rows
+
+    print("\n  RQ1 — so sánh ghép cặp, tách theo mức độ khớp hàm mất mát:")
+    all_rows = []
+    for r in _print_group(
+            "KHỚP CHÍNH XÁC — mọi chênh lệch quy được cho kiến trúc",
+            exact_match_pairs):
+        r["category"] = "exact_match"
+        all_rows.append(r)
+    for r in _print_group(
+            "TƯƠNG ĐỒNG PHÂN PHỐI — Tweedie≠Gamma, không phải khớp chính xác",
+            analogy_pairs):
+        r["category"] = "distributional_analogy"
+        all_rows.append(r)
+    for r in _print_group(
+            "MỐC THAM CHIẾU CHƯA KHỚP — Tweedie vs squared, để đối chiếu",
+            unmatched_reference_pairs):
+        r["category"] = "unmatched_reference"
+        all_rows.append(r)
+
+    if all_rows:
+        pd.DataFrame(all_rows).to_csv(
+            out_dir / "significance_rq1.csv", index=False)
 
     # ---- Kiểm định riêng trong từng nhóm mẫu nhu cầu (RQ3) ----
     if series is not None and best_pair and all(best_pair):

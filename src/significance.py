@@ -283,9 +283,14 @@ def seed_stability_table(results: pd.DataFrame, model_a: str, model_b: str,
     nhận được. Bảng liệt kê từng seed để phát hiện trường hợp đó, và để người
     đọc tự kiểm tra thay vì tin vào một con số tổng hợp duy nhất.
 
-    Cột quan trọng nhất là ``delta``: đây là đại lượng cần so sánh với độ lệch
-    chuẩn giữa các seed để trả lời câu hỏi trung tâm — chênh lệch giữa hai mô
-    hình có vượt qua nhiễu ngẫu nhiên của quá trình huấn luyện hay không.
+    Cột quan trọng nhất là ``delta``: đây là đại lượng cần đối chiếu với độ
+    lệch chuẩn giữa các seed. Cần nói rõ giới hạn của phép đối chiếu này:
+    tỷ lệ |Δ|/σ là một chỉ báo MÔ TẢ về mức độ nhất quán của chiều thắng qua
+    các seed, KHÔNG phải một kiểm định giả thuyết thống kê chính thức (không
+    có phân phối lấy mẫu hay p-value đi kèm tỷ lệ này). Nên diễn đạt kết quả
+    là "chênh lệch nhất quán qua N seed ngẫu nhiên", không diễn đạt như thể
+    đã "chứng minh" chênh lệch vượt qua nhiễu huấn luyện theo nghĩa suy luận
+    thống kê chặt chẽ.
     """
     sub = results[results.feature_set == feature_set]
     a = sub[sub.model == model_a].groupby("seed")[metric].mean()

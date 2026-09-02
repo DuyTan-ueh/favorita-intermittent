@@ -225,3 +225,139 @@ def _stratified_sample(df: pd.DataFrame, cfg: Config) -> pd.DataFrame:
     print(f"\nLấy mẫu phân tầng theo '{key}': "
           f"{len(df):,} -> {len(sampled):,} chuỗi")
     return sampled
+
+
+def _eligible_keys(cfg: Config, stats: pd.DataFrame) -> tuple[set, pd.DataFrame]:
+    """Áp đúng bộ lọc điều kiện (không lấy mẫu) và trả về tập khoá + bảng.
+
+    Tách riêng bước này khỏi ``select_series`` vì ``select_series`` còn gọi
+    thêm ``_stratified_sample`` khi bật lấy mẫu. Đo độ ổn định của tiêu chí
+    lọc mà lại đi qua bước lấy mẫu ngẫu nhiên là sai: hai lần gọi
+    ``DataFrame.sample(n, random_state=...)`` trên hai bảng có cùng nội dung
+    nhưng THỨ TỰ DÒNG khác nhau (hoàn toàn có thể xảy ra, vì mỗi lần gọi
+    ``compute_series_stats`` tích luỹ khoá vào một dict độc lập) sẽ chọn ra
+    những phần tử khác nhau, dù tiêu chí lọc và tập đủ điều kiện giống hệt
+    nhau. Đã kiểm chứng trực tiếp: hai tập giống hệt 100% nhưng khác thứ tự
+    dòng cho Jaccard sau lấy mẫu chỉ 18% — đủ để một kết luận sai hoàn toàn
+    về mức độ ổn định của việc chọn quần thể.
+    """
+    d = cfg.data
+    cutoff = stats.global_end.iloc[0] - pd.Timedelta(
+        days=d["require_active_until_end"])
+    mask = (
+        (stats.days_active >= d["min_days_active"])
+        & (stats.n_pos >= d["min_positive_days"])
+        & (stats.last_date >= cutoff)
+    )
+    eligible = stats[mask].copy()
+    keys = set(zip(eligible.store_nbr, eligible.item_nbr))
+    return keys, eligible
+
+
+def selection_sensitivity_check(cfg: Config, full_stats: pd.DataFrame,
+                                early_cutoff: str | pd.Timestamp) -> dict:
+    """Đo mức độ nghiêm trọng thật của việc chọn chuỗi dựa trên toàn timeline.
+
+    Tiêu chí chọn chuỗi (``select_series``) và phân loại mẫu nhu cầu
+    (``classify_pattern``) đều dùng thống kê tính trên TOÀN BỘ khoảng thời
+    gian nghiên cứu, kể cả phần nằm sau ``train_end`` của fold sớm nhất. Đây
+    là một dạng chọn quần thể phụ thuộc tương lai (future-dependent cohort
+    selection). Nó không làm sai số liệu huấn luyện của bất kỳ mô hình nào
+    (các nhãn này không được dùng làm đặc trưng đầu vào — chỉ dùng để lọc
+    quần thể và phân tầng kết quả), nhưng ảnh hưởng tới việc quần thể nghiên
+    cứu có đại diện cho "series khả dụng nếu chỉ biết thông tin tại một mốc
+    sớm hơn" hay không.
+
+    Hàm này so sánh THEO HAI TẦNG TÁCH BIỆT, không gộp chung:
+
+      1. Chồng lấp ELIGIBILITY (trước khi lấy mẫu) — đây là phép đo chính,
+         phản ánh đúng câu hỏi "tiêu chí lọc có phụ thuộc thông tin tương lai
+         theo cách ảnh hưởng thực chất không". Không đi qua bước lấy mẫu nên
+         không bị nhiễu bởi thứ tự dòng ngẫu nhiên.
+      2. Chồng lấp SAMPLE (sau khi lấy mẫu, dùng ``select_series`` đầy đủ) —
+         chỉ mang tính tham khảo, cho biết tập 25.000 chuỗi cụ thể thay đổi
+         ra sao, nhưng KHÔNG được dùng để kết luận về bản chất tiêu chí lọc.
+
+    Đây là một lần quét dữ liệu bổ sung (tốn thời gian tương đương một lần
+    chạy ``compute_series_stats``), không phải một thực nghiệm huấn luyện
+    mô hình.
+    """
+    import copy
+
+    cfg_early = copy.deepcopy(cfg)
+    cfg_early.data = dict(cfg.data)
+    cfg_early.data["end_date"] = str(pd.Timestamp(early_cutoff).date())
+
+    print(f"Tính lại thống kê chỉ dùng dữ liệu tới {early_cutoff} "
+          f"(giả lập thông tin có tại fold sớm nhất)...")
+    early_stats = compute_series_stats(cfg_early)
+
+    # ---- TẦNG 1 (chính): chồng lấp ELIGIBILITY, trước sampling ----
+    key_full_elig, elig_full = _eligible_keys(cfg, full_stats)
+    key_early_elig, elig_early = _eligible_keys(cfg, early_stats)
+
+    overlap_elig = key_full_elig & key_early_elig
+    union_elig = key_full_elig | key_early_elig
+    eligibility_jaccard = (len(overlap_elig) / len(union_elig)
+                           if union_elig else float("nan"))
+
+    # Đồng thuận nhãn pattern, tính trên phần eligibility chung — cũng
+    # không đi qua sampling.
+    common_elig = elig_full.merge(
+        elig_early[["store_nbr", "item_nbr", "pattern"]],
+        on=["store_nbr", "item_nbr"], suffixes=("_full", "_early"))
+    pattern_agree_elig = ((common_elig.pattern_full
+                          == common_elig.pattern_early).mean()
+                          if len(common_elig) else float("nan"))
+
+    # ---- TẦNG 2 (tham khảo): chồng lấp SAMPLE, sau sampling ----
+    full_sampled = select_series(cfg, full_stats.copy())
+    early_sampled = select_series(cfg, early_stats.copy())
+    key_full_s = set(zip(full_sampled.store_nbr, full_sampled.item_nbr))
+    key_early_s = set(zip(early_sampled.store_nbr, early_sampled.item_nbr))
+    sample_jaccard = (len(key_full_s & key_early_s)
+                      / len(key_full_s | key_early_s)
+                      if (key_full_s | key_early_s) else float("nan"))
+
+    result = {
+        "early_cutoff": str(early_cutoff),
+        "n_eligible_full_period": len(key_full_elig),
+        "n_eligible_early_only": len(key_early_elig),
+        "eligibility_jaccard_overlap": eligibility_jaccard,
+        "n_eligible_common": len(common_elig),
+        "pattern_label_agreement": pattern_agree_elig,
+        "sample_jaccard_overlap_INFO_ONLY": sample_jaccard,
+    }
+
+    print("\n--- TẦNG 1 (chính): chồng lấp ELIGIBILITY, trước sampling ---")
+    print(f"  Số chuỗi đủ điều kiện (toàn kỳ)      : "
+          f"{result['n_eligible_full_period']:,}")
+    print(f"  Số chuỗi đủ điều kiện (tới "
+          f"{early_cutoff}): {result['n_eligible_early_only']:,}")
+    print(f"  Chồng lấp eligibility (Jaccard)       : "
+          f"{eligibility_jaccard:.1%}")
+    print(f"  Đồng thuận nhãn pattern (trên phần chung, "
+          f"{len(common_elig):,} chuỗi): {pattern_agree_elig:.1%}")
+
+    print("\n--- TẦNG 2 (chỉ để tham khảo): chồng lấp SAMPLE sau lấy mẫu ---")
+    print(f"  Chồng lấp sample (Jaccard)            : {sample_jaccard:.1%}")
+    print("  Lưu ý: số này có thể THẤP hơn eligibility Jaccard đáng kể chỉ")
+    print("  do thứ tự dòng ngẫu nhiên giữa hai lần tính thống kê, KHÔNG")
+    print("  phản ánh riêng độ ổn định của tiêu chí lọc. Không dùng số này")
+    print("  để kết luận về bản chất selection.")
+
+    if eligibility_jaccard > 0.9 and pattern_agree_elig > 0.9:
+        print("\n  [đánh giá] Chồng lấp eligibility rất cao — dùng thông tin"
+              " toàn kỳ hay\n  chỉ tới fold sớm nhất cho kết quả gần như "
+              "nhau. Đây chủ yếu là vấn đề lý\n  thuyết, ảnh hưởng thực tế "
+              "nhỏ.")
+    elif eligibility_jaccard > 0.7 and pattern_agree_elig > 0.7:
+        print("\n  [đánh giá] Chồng lấp khá cao nhưng không hoàn toàn — nên"
+              " nêu rõ giới\n  hạn này trong Methodology, không cần viết "
+              "lại pipeline.")
+    else:
+        print("\n  [CẢNH BÁO] Chồng lấp eligibility thấp — việc chọn theo "
+              "toàn kỳ ảnh\n  hưởng đáng kể tới quần thể nghiên cứu. Nên cân"
+              " nhắc viết lại theo\n  hướng per-fold trước khi công bố RQ3.")
+
+    return result

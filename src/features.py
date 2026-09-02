@@ -24,12 +24,19 @@ không thể lọt qua chỉ vì người viết quên.
 
 Vì sao khuyến mãi được xếp vào nhóm biết trước
 ----------------------------------------------
-Đây là điểm cần cẩn trọng. Cột ``onpromotion`` của Favorita phản ánh kế hoạch
-khuyến mãi, tức thông tin có sẵn trước khi bán hàng diễn ra. Điều này khác hẳn
-với việc suy ngược trạng thái khuyến mãi TỪ doanh số tăng đột biến của chính
-ngày đó — cách làm ấy mới là rò rỉ, vì nó dùng kết quả để giải thích nguyên
-nhân. Các cột như số tiền giảm giá thực tế hay doanh thu cũng thuộc loại
-"chỉ biết sau khi đã bán", nên không được đưa vào làm đặc trưng.
+Cột ``onpromotion`` được cuộc thi Favorita cung cấp cho cả giai đoạn huấn
+luyện lẫn giai đoạn cần dự báo, ở cùng mức chi tiết ngày/cửa hàng/mã hàng —
+đây là căn cứ để xếp nó vào nhóm biết trước. Cần nói rõ giới hạn của khẳng
+định này: dữ liệu xác nhận cột này TỒN TẠI cho các ngày tương lai trong cấu
+trúc bài toán của cuộc thi, nhưng không chứng minh được quy trình nghiệp vụ
+thật của Favorita — ví dụ khuyến mãi được lên kế hoạch trước bao nhiêu ngày,
+hay có bị điều chỉnh sát ngày hay không. Nói cách khác, đây là một giả định
+được biện minh bởi cách cuộc thi cấu trúc dữ liệu, không phải một sự thật đã
+được kiểm chứng về vận hành nội bộ của doanh nghiệp. Ngược lại, việc suy
+ngược trạng thái khuyến mãi TỪ doanh số tăng đột biến của chính ngày đó mới
+chắc chắn là rò rỉ, vì nó dùng kết quả để suy ra nguyên nhân. Các cột như số
+tiền giảm giá thực tế hay doanh thu cũng thuộc loại "chỉ biết sau khi đã
+bán", nên không được đưa vào làm đặc trưng.
 """
 
 from __future__ import annotations

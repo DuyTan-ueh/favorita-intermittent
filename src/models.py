@@ -143,7 +143,16 @@ def resolve_device(requested: str = "auto") -> str:
     return "cuda"
 
 
-def _xgb_params(objective: str, seed: int, device: str = "cpu") -> dict:
+def _xgb_params(objective: str, seed: int, device: str = "cpu",
+                overrides: dict | None = None) -> dict:
+    """Siêu tham số cho XGBoost.
+
+    Các giá trị mặc định dưới đây là LỰA CHỌN TUỲ Ý, không qua bước tinh
+    chỉnh bằng validation — cần nói rõ điều này khi viết Methodology, không
+    trình bày như thể chúng đã được tối ưu. Tham số ``overrides`` cho phép
+    truyền giá trị khác từ ``config.yaml`` (mục ``experiment.xgb_params``)
+    khi có nhu cầu chạy một bước validation search nhỏ mà không cần sửa code.
+    """
     base = {
         "max_depth": 8,
         "learning_rate": 0.05,
@@ -155,6 +164,8 @@ def _xgb_params(objective: str, seed: int, device: str = "cpu") -> dict:
         "random_state": seed,
         "n_jobs": -1,
     }
+    if overrides:
+        base.update(overrides)
     base["objective"] = objective
     return base
 
@@ -210,7 +221,7 @@ STAGE2_OBJECTIVES = {
 
 def _fit_stage2(train_pos: pd.DataFrame, feature_cols: list[str],
                 spec: dict, seed: int, device: str, n_estimators: int,
-                shift: bool):
+                shift: bool, xgb_overrides: dict | None = None):
     """Huấn luyện mô hình độ lớn nhu cầu theo cấu hình hàm mất mát."""
     import xgboost as xgb
 
@@ -225,7 +236,7 @@ def _fit_stage2(train_pos: pd.DataFrame, feature_cols: list[str],
 
     model = xgb.XGBRegressor(
         n_estimators=n_estimators,
-        **_xgb_params(spec["objective"], seed, device))
+        **_xgb_params(spec["objective"], seed, device, xgb_overrides))
     model.fit(train_pos[feature_cols], y, verbose=False)
     return model
 
@@ -275,7 +286,8 @@ SINGLE_STAGE_OBJECTIVES = {
 def fit_single_stage(train: pd.DataFrame, test: pd.DataFrame,
                      feature_cols: list[str], seed: int = 42,
                      n_estimators: int = 300, device: str = "cpu",
-                     objective: str = "tweedie", **_) -> tuple:
+                     objective: str = "tweedie",
+                     xgb_overrides: dict | None = None, **_) -> tuple:
     """Hồi quy trực tiếp số lượng, không tách bài toán.
 
     Mặc định dùng Tweedie: phân phối này có khối xác suất tại không cộng với
@@ -295,7 +307,7 @@ def fit_single_stage(train: pd.DataFrame, test: pd.DataFrame,
         raise ValueError(f"objective không hợp lệ: {objective}. "
                          f"Chọn một trong {list(SINGLE_STAGE_OBJECTIVES)}")
 
-    params = _xgb_params(spec["objective"], seed, device)
+    params = _xgb_params(spec["objective"], seed, device, xgb_overrides)
     params.update(spec["extra"])
 
     y = train["y"]
@@ -313,7 +325,8 @@ def fit_single_stage(train: pd.DataFrame, test: pd.DataFrame,
 def fit_two_stage(train: pd.DataFrame, test: pd.DataFrame,
                   feature_cols: list[str], seed: int = 42,
                   n_estimators: int = 300, device: str = "cpu",
-                  stage2: str = "squared", shift: bool = False) -> tuple:
+                  stage2: str = "squared", shift: bool = False,
+                  xgb_overrides: dict | None = None) -> tuple:
     """Khung hai giai đoạn: phân loại khả năng có đơn, rồi hồi quy số lượng.
 
     Giai đoạn hai CHỈ được huấn luyện trên các quan sát có nhu cầu dương. Đây
@@ -333,13 +346,13 @@ def fit_two_stage(train: pd.DataFrame, test: pd.DataFrame,
     clf = xgb.XGBClassifier(
         n_estimators=n_estimators,
         eval_metric="logloss",
-        **_xgb_params("binary:logistic", seed, device))
+        **_xgb_params("binary:logistic", seed, device, xgb_overrides))
     clf.fit(train[feature_cols], train["y_occurrence"], verbose=False)
 
     # --- Giai đoạn 2: số lượng, chỉ trên ngày có đơn ---
     pos = train[train.y_occurrence == 1]
     reg = _fit_stage2(pos, feature_cols, spec, seed, device,
-                      n_estimators, shift)
+                      n_estimators, shift, xgb_overrides)
 
     prob = clf.predict_proba(test[feature_cols])[:, 1]
     magnitude = _predict_stage2(reg, test[feature_cols], spec, shift)

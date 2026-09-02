@@ -46,10 +46,13 @@ split:
   # Rolling-origin backtesting — KHÔNG random split
   n_folds: 3
   test_days: 28             # mỗi fold test 28 ngày
-  gap_days: 0               # khoảng đệm giữa train và test
+  gap_days: 0               # khoảng đệm (embargo) giữa train và test
   # Sinh thêm định nghĩa fold cho từng giá trị gap để so sánh ở bước huấn
-  # luyện. gap=0 giả định huấn luyện lại mỗi ngày; gap=horizon mô phỏng huấn
-  # luyện một lần rồi dự báo cả chu kỳ mà không cập nhật.
+  # luyện. gap=N tạo khoảng đệm N ngày giữa lúc huấn luyện kết thúc và lúc
+  # đánh giá bắt đầu (đo độ "cũ" của tham số mô hình). LƯU Ý: đặc trưng
+  # lag/rolling không bị đóng băng theo gap — chúng luôn dịch theo horizon
+  # so với ngày của từng dòng, kể cả trong khoảng đệm. Xem README mục
+  # "Định nghĩa fold" để biết chi tiết.
   gap_variants: [0, 7]
 
 experiment:
@@ -82,6 +85,16 @@ experiment:
   #               chuỗi có quá nửa số ngày không bán
   #   squared   - mốc so sánh
   single_stage_objectives: [tweedie, absolute, squared]
+
+  # Ghi đè siêu tham số XGBoost mặc định (max_depth=8, learning_rate=0.05,
+  # subsample=0.8, colsample_bytree=0.8, min_child_weight=5). Để trống (null)
+  # thì dùng nguyên giá trị mặc định — các giá trị này CHƯA qua bước tinh
+  # chỉnh, chỉ là lựa chọn ban đầu. Dùng mục này để cắm một bộ giá trị đã
+  # chọn qua validation search nhỏ mà không cần sửa code.
+  # xgb_params:
+  #   max_depth: 6
+  #   learning_rate: 0.1
+  xgb_params: null
 
   # Mô hình hoá phần dư y-1 thay vì y, vì nhu cầu dương nhỏ nhất là 1.
   stage2_shift: false

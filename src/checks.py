@@ -175,18 +175,32 @@ def rolling_origin_folds(df: pd.DataFrame, cfg: Config,
     dịch cửa sổ kiểm tra về phía sau, mô phỏng đúng cách mô hình được dùng
     trong thực tế.
 
-    Tham số ``gap_days`` chèn khoảng đệm giữa huấn luyện và kiểm tra, và lựa
-    chọn giá trị nào phản ánh một giả định vận hành khác nhau:
+    Tham số ``gap_days`` chèn khoảng đệm (embargo) giữa ngày cuối tập huấn
+    luyện và ngày đầu tập kiểm tra. Cần hiểu đúng nó đo cái gì:
 
       ``gap = 0``
-          Ngầm định mô hình được huấn luyện lại mỗi ngày, luôn có dữ liệu tới
-          sát thời điểm dự báo. Đây là kịch bản lạc quan.
+          Không có khoảng đệm — mô phỏng kịch bản huấn luyện lại sát thời
+          điểm dự báo.
 
       ``gap = horizon``
-          Mô hình huấn luyện một lần rồi dự báo trọn chu kỳ mà không cập nhật.
-          Sát thực tế vận hành hơn, và cũng chặt chẽ hơn vì loại bỏ khả năng
-          dòng cuối tập huấn luyện và dòng đầu tập kiểm tra chia sẻ cùng cửa
-          sổ lịch sử.
+          Khoảng đệm bằng đúng horizon, mô phỏng mô hình đã "cũ" đi một
+          khoảng thời gian trước khi được dùng để dự báo.
+
+    Lưu ý quan trọng về những gì tham số này KHÔNG kiểm soát: đặc trưng
+    (lag, rolling) được sinh một lần trên toàn bộ lưới theo ngày của chính
+    mỗi dòng (xem ``features.py``, luôn dịch tối thiểu ``horizon`` ngày so
+    với ngày đó), không phụ thuộc ranh giới fold. Vì vậy một dòng kiểm tra ở
+    ``test_start`` vẫn mang giá trị lag tính từ dữ liệu thực nằm TRONG
+    khoảng đệm (giữa ``train_end`` và ``test_start``), không phải dữ liệu bị
+    đóng băng tại ``train_end``. Tham số ``gap`` do đó đo độ "cũ" của tham số
+    mô hình đã huấn luyện so với thời điểm đánh giá — không đo việc đặc
+    trưng có được cập nhật hay không, vì đặc trưng luôn được cập nhật theo
+    đúng ngày của từng dòng. Đây là một thiết kế hợp lệ (nhiều hệ thống sản
+    xuất thực tế vận hành đúng kiểu "huấn luyện định kỳ, đặc trưng cập nhật
+    liên tục"), nhưng khác với việc "huấn luyện một lần rồi dự báo trọn chu
+    kỳ mà hoàn toàn không có thông tin gì mới" — nếu muốn kiểm định đúng
+    kịch bản đó thì cần đóng băng đặc trưng tại ``train_end`` hoặc dự báo đệ
+    quy, việc này chưa được triển khai.
     """
     s = cfg.split
     gap = s["gap_days"] if gap_days is None else gap_days

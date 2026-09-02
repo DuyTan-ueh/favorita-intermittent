@@ -5,11 +5,50 @@ Corporación Favorita.
 
 ## Câu hỏi nghiên cứu
 
+Hướng nghiên cứu: literature 2026 gần đây cho kết quả trái chiều về việc
+kiến trúc hai giai đoạn có cải thiện dự báo nhu cầu gián đoạn hay không
+(Sucuoğlu et al. 2026 nghiêng về có; Nathan et al. 2026/SHOS nghiêng về
+không). Nghiên cứu này không claim Two-Stage hay khuyến mãi là ý tưởng mới,
+mà kiểm định có kiểm soát xem hiệu quả của kiến trúc hai giai đoạn có phụ
+thuộc vào hàm mất mát dùng cho phần dự báo độ lớn hay không — một cơ chế có
+thể giải thích vì sao hai nghiên cứu trên cho kết luận khác nhau.
+
 | | Câu hỏi |
 |---|---|
-| **RQ1** | Two-Stage ML có tốt hơn dự báo một bước và Croston/SBA/TSB không? |
-| **RQ2** | Đặc trưng khuyến mãi, lịch, sự kiện cải thiện dự báo bao nhiêu? |
-| **RQ3** | Hiệu quả thay đổi thế nào giữa các nhóm mức độ gián đoạn khác nhau? |
+| **RQ1** | Trong điều kiện hàm mất mát được kiểm soát, khi nào kiến trúc hai giai đoạn cải thiện dự báo so với một giai đoạn và các phương pháp cổ điển (Croston/SBA/TSB)? |
+| **RQ2** | Hiệu quả của các hàm mất mát khác nhau cho phần dự báo độ lớn thay đổi thế nào trong nội bộ kiến trúc hai giai đoạn? |
+| **RQ3** | Hiệu quả của kiến trúc/hàm mất mát/bộ đặc trưng thay đổi thế nào giữa các nhóm mẫu nhu cầu (Smooth/Erratic/Intermittent/Lumpy)? *(phân tích hồi cứu — xem mục giới hạn bên dưới)* |
+
+Bộ đặc trưng xếp chồng (historical → calendar → holiday → promotion → static)
+và hai kịch bản `gap` vẫn được giữ làm bối cảnh thực nghiệm (information set,
+độ "cũ" của mô hình), không phải trục câu hỏi chính.
+
+## Giới hạn về quần thể nghiên cứu (đọc trước khi diễn giải RQ3)
+
+Tiêu chí chọn 25.000 chuỗi (`days_active`, `n_pos`, còn bán tới cuối kỳ) và
+nhãn phân nhóm Smooth/Erratic/Intermittent/Lumpy đều được tính trên **toàn bộ
+khoảng thời gian nghiên cứu**, không tính riêng theo từng fold. Hai nhãn này
+**không được dùng làm đặc trưng đầu vào cho bất kỳ mô hình nào** — chỉ dùng để
+xác định quần thể nghiên cứu và phân tầng kết quả sau khi đánh giá. Cần nói
+chính xác điều này loại trừ được gì và không loại trừ được gì: nó không gây
+rò rỉ đặc trưng/nhãn vào quá trình huấn luyện (không có target hay feature
+nào "nhìn thấy" thông tin tương lai), nhưng KHÔNG có nghĩa là không ảnh hưởng
+gì — nó vẫn có thể ảnh hưởng tới việc quần thể được đánh giá có đại diện hay
+không. Hai hệ quả cụ thể cần nêu rõ khi viết bài:
+
+1. Quần thể 25.000 chuỗi là một **cohort cố định được xác định trên toàn kỳ**
+   ("continuing, moderately active SKU-store series"), không đại diện cho
+   toàn bộ danh mục Favorita — đặc biệt loại trừ các mã hàng đã ngừng kinh
+   doanh giữa chừng.
+2. Nhãn demand-pattern trong RQ3 mô tả **đặc tính đo được trên toàn bộ cửa sổ
+   nghiên cứu**, không phải một nhãn có thể biết được tại thời điểm dự báo
+   thực tế của từng fold sớm.
+
+Chạy `python -c "from src.data import selection_sensitivity_check; ..."` (xem
+docstring trong `src/data.py`) để đo thực nghiệm mức độ chênh lệch giữa cách
+chọn theo toàn kỳ và cách chọn chỉ dùng thông tin tới một mốc sớm — kết quả
+cho biết đây chủ yếu là giới hạn lý thuyết hay ảnh hưởng thực chất tới quần
+thể, dựa trên chính dữ liệu Favorita thay vì suy đoán.
 
 ## Cài đặt
 
@@ -147,11 +186,26 @@ bộ nhớ — khi đó mẫu thu được thiên lệch mà không có dấu hi
 
 ### 5. Hai kịch bản đánh giá song song
 
-`gap_days` quyết định khoảng đệm giữa tập huấn luyện và tập kiểm tra, và mỗi
-giá trị phản ánh một giả định vận hành khác nhau:
+`gap_days` chèn khoảng đệm (embargo) giữa ngày cuối tập huấn luyện và ngày
+đầu tập kiểm tra:
 
-- `gap = 0` — ngầm định mô hình được huấn luyện lại mỗi ngày. Kịch bản lạc quan.
-- `gap = 7` — huấn luyện một lần rồi dự báo trọn chu kỳ. Sát thực tế hơn.
+- `gap = 0` — không có khoảng đệm, huấn luyện sát thời điểm đánh giá.
+- `gap = 7` — khoảng đệm 7 ngày giữa lúc huấn luyện kết thúc và lúc đánh giá
+  bắt đầu, mô phỏng mô hình đã "cũ" đi một khoảng thời gian.
+
+**Lưu ý quan trọng:** tham số này chỉ thay đổi ranh giới ngày dùng để cắt
+tập huấn luyện/kiểm tra, KHÔNG đóng băng đặc trưng. Đặc trưng lag/rolling
+được sinh một lần trên toàn bộ lưới, luôn dịch tối thiểu `horizon` ngày so
+với ngày của chính mỗi dòng — nên một dòng kiểm tra ở đầu cửa sổ `gap=7` vẫn
+mang giá trị lag tính từ dữ liệu thực nằm trong khoảng đệm, không phải dữ
+liệu bị đóng băng tại `train_end`. Nói cách khác, `gap` đo độ "cũ" của tham
+số mô hình đã huấn luyện so với thời điểm đánh giá, không đo việc đặc trưng
+có được cập nhật hay không (đặc trưng luôn được cập nhật theo đúng ngày của
+từng dòng). Đây là thiết kế hợp lệ (nhiều hệ thống sản xuất thực tế vận hành
+kiểu "huấn luyện định kỳ, đặc trưng cập nhật liên tục"), khác với việc kiểm
+định kịch bản "huấn luyện một lần, dự báo trọn chu kỳ mà hoàn toàn không có
+thông tin gì mới" — nếu cần kịch bản đó thì phải đóng băng đặc trưng tại
+`train_end` hoặc dự báo đệ quy, chưa được triển khai trong repo này.
 
 Vì `gap_days` chỉ ảnh hưởng ranh giới fold chứ không ảnh hưởng đặc trưng, cả
 hai bộ fold được sinh trong cùng một lần chạy thay vì chạy lại pipeline hai lần.

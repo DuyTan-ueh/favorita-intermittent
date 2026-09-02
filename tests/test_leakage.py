@@ -866,3 +866,223 @@ class TestMultiSeedWiring:
                                       series, seed=999, run_baselines=False)
         assert all(r["seed"] == 999 for r in res)
         assert all((s.seed == 999).all() for s in strat)
+
+
+# --------------------------------------------------------------------------- #
+# Diagnostic: mức độ nghiêm trọng thật của việc chọn chuỗi theo toàn kỳ
+# --------------------------------------------------------------------------- #
+class TestSelectionSensitivity:
+    @staticmethod
+    def _write_fixture(tmp_path, mid_frac=0.5, n_stable=15, n_late=10,
+                       seed=1):
+        """Ghi ra một bộ dữ liệu giả có cấu trúc giống Favorita, với một nhóm
+        chuỗi cố ý chỉ hoạt động mạnh ở nửa sau — để kiểm tra diagnostic có
+        thực sự phát hiện được chênh lệch hay không, thay vì luôn báo
+        'chồng lấp cao' một cách vô nghĩa.
+        """
+        rng = np.random.default_rng(seed)
+        dates = pd.date_range("2014-04-01", "2015-12-31", freq="D")
+        mid = int(len(dates) * mid_frac)
+        rows = []
+        for it in range(n_stable):
+            mask = rng.random(len(dates)) < 0.5
+            q = rng.poisson(4, len(dates)) + 1
+            sel = np.flatnonzero(mask)
+            rows.append(pd.DataFrame({
+                "date": dates[sel], "store_nbr": 1, "item_nbr": 1000 + it,
+                "unit_sales": q[sel].astype("float32"), "onpromotion": False}))
+        for it in range(n_late):
+            mask = np.zeros(len(dates), dtype=bool)
+            mask[:mid] = rng.random(mid) < 0.02
+            mask[mid:] = rng.random(len(dates) - mid) < 0.7
+            q = rng.poisson(3, len(dates)) + 1
+            sel = np.flatnonzero(mask)
+            if len(sel) < 10:
+                continue
+            rows.append(pd.DataFrame({
+                "date": dates[sel], "store_nbr": 1, "item_nbr": 2000 + it,
+                "unit_sales": q[sel].astype("float32"), "onpromotion": False}))
+
+        t = pd.concat(rows, ignore_index=True)
+        t.insert(0, "id", np.arange(len(t)))
+        raw = tmp_path / "raw"
+        raw.mkdir()
+        t.to_csv(raw / "train.csv", index=False)
+        pd.DataFrame({"item_nbr": list(range(1000, 1000 + n_stable))
+                      + list(range(2000, 2000 + n_late)),
+                     "family": "G", "class": 1, "perishable": 0}
+                     ).to_csv(raw / "items.csv", index=False)
+        pd.DataFrame({"store_nbr": [1], "city": "Q", "state": "P",
+                      "type": "A", "cluster": 1}
+                     ).to_csv(raw / "stores.csv", index=False)
+        pd.DataFrame({"date": [], "type": [], "locale": [],
+                      "locale_name": [], "description": [],
+                      "transferred": []}
+                     ).to_csv(raw / "holidays_events.csv", index=False)
+        return raw, dates[mid]
+
+    @staticmethod
+    def _cfg(raw_dir, tmp_path, min_positive_days=15,
+            require_active_until_end=30):
+        from src.config import Config
+        raw = {
+            "run": {"name": "t", "seed": 1},
+            "data": {"start_date": "2014-04-01", "end_date": None,
+                     "min_days_active": 100,
+                     "min_positive_days": min_positive_days,
+                     "require_active_until_end": require_active_until_end},
+            "sampling": {"enabled": False, "n_series": 10000,
+                        "stratify_by": "pattern"},
+            "forecast": {"horizon": 7},
+            "features": {"lags": [7], "rolling_windows": [7],
+                        "rolling_stats": ["mean"], "use_calendar": True,
+                        "use_promotion": True, "use_holidays": True,
+                        "use_static": True},
+            "split": {"n_folds": 1, "test_days": 28, "gap_days": 0},
+            "output": {"dir": str(tmp_path / "out"), "format": "parquet",
+                      "batch_size": 5000},
+        }
+        return Config(raw=raw, raw_dir=raw_dir, out_dir=tmp_path / "out",
+                     **{k: raw[k] for k in
+                        ["run", "data", "sampling", "forecast", "features",
+                         "split", "output"]})
+
+    def test_detects_real_divergence_when_populations_differ(self, tmp_path):
+        """Khi nhóm 'nở muộn' đủ lớn, chồng lấp PHẢI thấp hơn — nếu diagnostic
+        luôn báo chồng lấp cao bất kể dữ liệu thế nào thì nó vô dụng.
+        """
+        from src.data import compute_series_stats, selection_sensitivity_check
+
+        raw_dir, mid_date = self._write_fixture(
+            tmp_path, mid_frac=0.5, n_stable=10, n_late=15)
+        cfg = self._cfg(raw_dir, tmp_path)
+
+        stats = compute_series_stats(cfg)
+        result = selection_sensitivity_check(cfg, stats, early_cutoff=mid_date)
+
+        assert (result["n_eligible_full_period"]
+                > result["n_eligible_early_only"])
+        assert 0.0 <= result["eligibility_jaccard_overlap"] < 1.0
+
+    def test_full_overlap_when_no_late_arrivals(self, tmp_path):
+        """Không có chuỗi nở muộn -> chồng lấp phải gần như tuyệt đối.
+
+        Đây là bài kiểm tra ngược: nếu quần thể ổn định suốt kỳ, early cutoff
+        gần cuối kỳ không được làm giảm đáng kể số chuỗi được chọn.
+        """
+        from src.data import compute_series_stats, selection_sensitivity_check
+
+        raw_dir, _ = self._write_fixture(
+            tmp_path, mid_frac=0.5, n_stable=20, n_late=0)
+        cfg = self._cfg(raw_dir, tmp_path)
+
+        stats = compute_series_stats(cfg)
+        late_cutoff = pd.Timestamp("2015-11-01")  # rất gần cuối kỳ
+        result = selection_sensitivity_check(cfg, stats,
+                                             early_cutoff=late_cutoff)
+
+        assert result["eligibility_jaccard_overlap"] > 0.9
+
+    def test_returns_valid_dict_shape(self, tmp_path):
+        from src.data import compute_series_stats, selection_sensitivity_check
+
+        raw_dir, mid_date = self._write_fixture(tmp_path, n_stable=5, n_late=3)
+        cfg = self._cfg(raw_dir, tmp_path)
+        stats = compute_series_stats(cfg)
+        result = selection_sensitivity_check(cfg, stats, early_cutoff=mid_date)
+
+        required = {"early_cutoff", "n_eligible_full_period",
+                   "n_eligible_early_only", "eligibility_jaccard_overlap",
+                   "n_eligible_common", "pattern_label_agreement",
+                   "sample_jaccard_overlap_INFO_ONLY"}
+        assert required.issubset(result.keys())
+
+    def test_eligibility_jaccard_immune_to_row_order_unlike_sample_jaccard(
+            self, tmp_path):
+        """Kiểm tra hồi quy cho đúng lỗi đã phát hiện: khi eligibility giống
+        hệt nhau (100%) nhưng thứ tự dòng khác nhau, Jaccard ở TẦNG ELIGIBILITY
+        phải gần như tuyệt đối, bất kể sample_jaccard (tầng tham khảo) ra sao.
+
+        Trước khi sửa, hàm cũ so trực tiếp tập đã lấy mẫu nên có thể báo
+        Jaccard chỉ ~18% dù eligibility giống hệt 100% — đã kiểm chứng bằng
+        thực nghiệm độc lập trước khi sửa. Test này khoá lại hành vi đúng.
+        """
+        from src.data import compute_series_stats, selection_sensitivity_check
+
+        # Toàn bộ chuỗi ổn định suốt kỳ -> early cutoff gần cuối kỳ vẫn phải
+        # cho eligibility giống hệt gần như tuyệt đối.
+        raw_dir, _ = self._write_fixture(
+            tmp_path, mid_frac=0.5, n_stable=25, n_late=0)
+        cfg = self._cfg(raw_dir, tmp_path)
+        stats = compute_series_stats(cfg)
+
+        late_cutoff = pd.Timestamp("2015-12-01")
+        result = selection_sensitivity_check(cfg, stats,
+                                             early_cutoff=late_cutoff)
+
+        assert result["eligibility_jaccard_overlap"] > 0.95
+        # sample_jaccard là thông tin tham khảo, có thể thấp hơn eligibility
+        # do lấy mẫu ngẫu nhiên -- test không ràng buộc giá trị của nó, chỉ
+        # xác nhận nó tồn tại và không được dùng làm phép đo chính.
+        assert "sample_jaccard_overlap_INFO_ONLY" in result
+
+    def test_sample_jaccard_can_diverge_from_eligibility_jaccard(self):
+        """Bằng chứng trực tiếp cho lỗi đã sửa: dựng 2 bảng có eligibility
+        giống hệt 100% nhưng thứ tự dòng khác nhau, xác nhận việc lấy mẫu SAU
+        khi đã biết eligibility có thể cho Jaccard thấp hơn nhiều so với
+        Jaccard của chính eligibility - đây chính là lý do phải tách hai
+        tầng đo lường, không được dùng sample Jaccard làm kết luận chính.
+        """
+        rng = np.random.default_rng(99)
+        n = 500
+        df_a = pd.DataFrame({"store_nbr": 1, "item_nbr": range(n),
+                             "pattern": "Intermittent"})
+        shuffled = rng.permutation(n)
+        df_b = df_a.iloc[shuffled].reset_index(drop=True)
+
+        def stratified(df, seed, frac):
+            picked = []
+            for _, g in df.groupby("pattern", sort=False):
+                take = max(1, int(round(len(g) * frac)))
+                picked.append(g.sample(n=min(take, len(g)),
+                                       random_state=seed))
+            return pd.concat(picked)
+
+        # Eligibility giống hệt 100% theo định nghĩa của phép dựng này
+        key_a_elig = set(zip(df_a.store_nbr, df_a.item_nbr))
+        key_b_elig = set(zip(df_b.store_nbr, df_b.item_nbr))
+        eligibility_jaccard = (len(key_a_elig & key_b_elig)
+                               / len(key_a_elig | key_b_elig))
+        assert eligibility_jaccard == 1.0  # đúng như thiết kế phép dựng
+
+        sample_a = stratified(df_a, 42, 0.3)
+        sample_b = stratified(df_b, 42, 0.3)
+        key_a_s = set(zip(sample_a.store_nbr, sample_a.item_nbr))
+        key_b_s = set(zip(sample_b.store_nbr, sample_b.item_nbr))
+        sample_jaccard = len(key_a_s & key_b_s) / len(key_a_s | key_b_s)
+
+        # Đây chính là bằng chứng: sample Jaccard thấp hơn HẲN eligibility
+        # Jaccard dù xuất phát từ cùng một quần thể đủ điều kiện.
+        assert sample_jaccard < 0.5
+        assert eligibility_jaccard - sample_jaccard > 0.4
+
+class TestHyperparamOverride:
+    def test_default_unchanged_when_no_override(self):
+        from src.models import _xgb_params
+        p = _xgb_params("reg:squarederror", seed=1, device="cpu")
+        assert p["max_depth"] == 8
+        assert p["learning_rate"] == 0.05
+
+    def test_override_replaces_only_specified_keys(self):
+        from src.models import _xgb_params
+        p = _xgb_params("reg:squarederror", seed=1, device="cpu",
+                        overrides={"max_depth": 6})
+        assert p["max_depth"] == 6
+        assert p["learning_rate"] == 0.05  # các khoá khác giữ nguyên
+
+    def test_none_override_behaves_like_no_override(self):
+        from src.models import _xgb_params
+        a = _xgb_params("reg:squarederror", seed=1, device="cpu")
+        b = _xgb_params("reg:squarederror", seed=1, device="cpu",
+                        overrides=None)
+        assert a == b
