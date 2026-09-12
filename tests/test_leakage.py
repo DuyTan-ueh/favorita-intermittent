@@ -1086,3 +1086,157 @@ class TestHyperparamOverride:
         b = _xgb_params("reg:squarederror", seed=1, device="cpu",
                         overrides=None)
         assert a == b
+
+
+class TestRQ3PreSpecifiedVsExploratory:
+    """Khoá lại lỗi đã phát hiện: RQ3 từng chỉ có 1 bảng chọn 'nhà vô địch'
+    dựa trên chính test set rồi phân tích tiếp trên test set đó — một dạng
+    post-hoc selection. Nay phải có 2 bảng tách biệt: cố định (khai báo
+    trước) và khám phá (chọn sau khi xem test).
+    """
+
+    def test_print_rq3_table_uses_exact_given_pair_not_auto_selected(self):
+        """BẢNG A phải luôn dùng đúng cặp truyền vào, không tự chọn biến thể
+        nào khác dù trong dữ liệu có biến thể WAPE thấp hơn.
+        """
+        import tempfile
+        from pathlib import Path
+        from src.experiment import _print_rq3_table
+
+        full = pd.DataFrame([
+            {"pattern": "Smooth", "model": "Single-Stage", "wape": 0.50,
+             "n_series": 10, "zero_rate": 0.1},
+            {"pattern": "Smooth", "model": "Two-Stage", "wape": 0.48,
+             "n_series": 10, "zero_rate": 0.1},
+            # biến thể khác có WAPE thấp hơn nhiều -- KHÔNG được tự chọn
+            {"pattern": "Smooth", "model": "Two-Stage[absolute]",
+             "wape": 0.30, "n_series": 10, "zero_rate": 0.1},
+        ])
+        with tempfile.TemporaryDirectory() as d:
+            out = _print_rq3_table(
+                full, ("Single-Stage", "Two-Stage"), "test",
+                Path(d) / "out.csv")
+        assert "Two-Stage" in out.columns
+        assert "Two-Stage[absolute]" not in out.columns
+
+    def test_fixed_pair_independent_of_which_variant_wins_overall(self):
+        """Bảng A không được đổi cặp so sánh dù biến thể nào thắng WAPE tổng.
+
+        Đây chính là bất biến cần có: nhà vô địch tổng thể (dù là squared,
+        gamma hay absolute) không được ảnh hưởng tới việc Bảng A dùng cặp
+        nào -- Bảng A luôn cố định 'Single-Stage' và 'Two-Stage' mặc định.
+        """
+        from src.experiment import _print_rq3_table
+        import tempfile
+        from pathlib import Path
+
+        for winner_wape in [0.10, 0.90]:  # biến thể khác thắng hoặc thua xa
+            full = pd.DataFrame([
+                {"pattern": "Lumpy", "model": "Single-Stage", "wape": 0.50,
+                 "n_series": 5, "zero_rate": 0.4},
+                {"pattern": "Lumpy", "model": "Two-Stage", "wape": 0.48,
+                 "n_series": 5, "zero_rate": 0.4},
+                {"pattern": "Lumpy", "model": "Two-Stage[gamma]",
+                 "wape": winner_wape, "n_series": 5, "zero_rate": 0.4},
+            ])
+            with tempfile.TemporaryDirectory() as d:
+                out = _print_rq3_table(
+                    full, ("Single-Stage", "Two-Stage"), "test",
+                    Path(d) / "out.csv")
+            assert list(out.columns).count("Two-Stage") <= 1
+            assert "Two-Stage[gamma]" not in out.columns
+
+    def test_exploratory_pair_can_differ_from_fixed_pair(self):
+        """Bảng B (khám phá) được PHÉP chọn biến thể khác Bảng A -- đây là
+        đúng thiết kế, không phải lỗi. Test chỉ xác nhận cơ chế chọn của
+        Bảng B (dựa trên bias trong khoảng cho phép rồi WAPE nhỏ nhất) hoạt
+        động đúng như mô tả.
+        """
+        full = pd.DataFrame([
+            {"pattern": "Smooth", "model": "Two-Stage", "arch": "Two-Stage",
+             "wape": 0.50, "bias_ratio": 1.02, "n_series": 5,
+             "zero_rate": 0.1, "feature_set": "full"},
+            {"pattern": "Smooth", "model": "Two-Stage[gamma]",
+             "arch": "Two-Stage", "wape": 0.45, "bias_ratio": 0.98,
+             "n_series": 5, "zero_rate": 0.1, "feature_set": "full"},
+            # bias lệch quá 5% -- phải bị loại dù WAPE thấp nhất
+            {"pattern": "Smooth", "model": "Two-Stage[absolute]",
+             "arch": "Two-Stage", "wape": 0.30, "bias_ratio": 0.80,
+             "n_series": 5, "zero_rate": 0.1, "feature_set": "full"},
+        ])
+        sub = full[full.arch == "Two-Stage"]
+        agg = sub.groupby("model").agg(wape=("wape", "mean"),
+                                       bias=("bias_ratio", "mean"))
+        ok = agg[agg.bias.between(0.95, 1.05)]
+        best = (ok if len(ok) else agg).wape.idxmin()
+        assert best == "Two-Stage[gamma]"  # đúng biến thể có bias hợp lệ
+
+
+class TestRQ3SignificancePairSeparation:
+    """Khoá lại lỗi: kiểm định RQ3 từng CHỈ chạy trên cặp chọn post-hoc.
+
+    Phần mô tả đã tách Bảng A/B từ trước, nhưng phần KIỂM ĐỊNH thì bị bỏ sót
+    — p-value và Cohen's d vẫn tính trên cặp được chọn bằng idxmin() trên
+    chính test set. Nay phải chạy cặp cố định trước, cặp post-hoc chỉ là phụ
+    và bắt buộc kèm cảnh báo.
+    """
+
+    @staticmethod
+    def _make_losses():
+        rng = np.random.default_rng(3)
+        n = 200
+        frames = []
+        for key in ["Single-Stage|full", "Two-Stage|full",
+                    "Two-Stage[absolute]|full"]:
+            frames.append(pd.DataFrame({
+                "store_nbr": 1, "item_nbr": np.arange(n),
+                "model_key": key, "fold": 0,
+                "mae": rng.gamma(2, 1, n)}))
+        losses = pd.concat(frames, ignore_index=True)
+        series = pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                               "pattern": "Intermittent"})
+        return losses, series
+
+    def test_fixed_pair_runs_even_without_best_pair(self, tmp_path, capsys):
+        """Cặp cố định phải chạy kể cả khi best_pair là None."""
+        from src.experiment import _rq3_significance
+        losses, series = self._make_losses()
+        _rq3_significance(losses, series, ("Single-Stage", "Two-Stage"),
+                          tmp_path, title="CHÍNH", filename="fixed.csv")
+        out = capsys.readouterr().out
+        assert "Single-Stage|full" in out and "Two-Stage|full" in out
+        assert (tmp_path / "fixed.csv").exists()
+
+    def test_exploratory_pair_prints_caveat(self, tmp_path, capsys):
+        """Cặp post-hoc BẮT BUỘC in cảnh báo, nếu không người đọc sẽ hiểu
+        nhầm p-value ở đó là bằng chứng xác nhận."""
+        from src.experiment import _rq3_significance
+        losses, series = self._make_losses()
+        _rq3_significance(
+            losses, series, ("Single-Stage", "Two-Stage[absolute]"),
+            tmp_path, title="PHỤ", filename="explor.csv",
+            caveat="Cặp này được chọn dựa trên kết quả của chính tập kiểm tra")
+        out = capsys.readouterr().out
+        assert "CẢNH BÁO" in out
+        assert (tmp_path / "explor.csv").exists()
+
+    def test_two_pairs_write_separate_files(self, tmp_path):
+        """Hai bảng phải ghi ra hai file riêng, không đè lên nhau — nếu đè
+        thì bằng chứng xác nhận sẽ bị thay bằng kết quả khám phá."""
+        from src.experiment import _rq3_significance
+        losses, series = self._make_losses()
+        _rq3_significance(losses, series, ("Single-Stage", "Two-Stage"),
+                          tmp_path, title="A", filename="fixed.csv")
+        _rq3_significance(losses, series,
+                          ("Single-Stage", "Two-Stage[absolute]"),
+                          tmp_path, title="B", filename="explor.csv",
+                          caveat="x")
+        assert (tmp_path / "fixed.csv").exists()
+        assert (tmp_path / "explor.csv").exists()
+
+    def test_missing_model_returns_silently(self, tmp_path, capsys):
+        from src.experiment import _rq3_significance
+        losses, series = self._make_losses()
+        _rq3_significance(losses, series, ("Không-có", "Two-Stage"),
+                          tmp_path, title="X", filename="none.csv")
+        assert not (tmp_path / "none.csv").exists()

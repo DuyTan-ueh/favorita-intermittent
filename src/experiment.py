@@ -361,11 +361,17 @@ def _bias_diagnostics(results: pd.DataFrame, gap: int) -> None:
         corr = float(tab.wape.corr(tab.bias))
         print(f"\n  Tương quan giữa WAPE và độ chệch: {corr:+.3f}")
         if corr > 0.6:
-            print("  [QUAN TRỌNG] Tương quan dương mạnh: WAPE đang THƯỞNG cho "
-                  "việc dự báo thiếu.\n"
-                  "  Không được xếp hạng mô hình chỉ bằng WAPE trên dữ liệu "
-                  "này. Phải đối chiếu\n"
-                  "  với RMSE, RMSSE và độ chệch trước khi kết luận.")
+            print("  [QUAN TRỌNG] Tương quan dương mạnh giữa WAPE và độ "
+                  "chệch trên dữ liệu này:\n"
+                  "  mô hình có WAPE thấp hơn có xu hướng dự báo thiếu nhiều "
+                  "hơn. Đây là hệ quả\n"
+                  "  của việc sai số tuyệt đối tối thiểu hoá tại trung vị, "
+                  "vốn thấp hơn kỳ vọng\n"
+                  "  trên dữ liệu nhiều số không (xem Kolassa 2016). Không "
+                  "nên xếp hạng mô hình\n"
+                  "  chỉ bằng WAPE trên dữ liệu này — phải đối chiếu với "
+                  "RMSE, RMSSE và độ chệch\n"
+                  "  trước khi kết luận.")
 
 
 def _matched_loss_comparison(results: pd.DataFrame, out_dir: Path,
@@ -459,6 +465,12 @@ def _recommend_model(results: pd.DataFrame, out_dir: Path,
     chính xác sau — đúng thứ tự ưu tiên của bài toán tồn kho.
     """
     _banner(f"MÔ HÌNH KHUYẾN NGHỊ (gap={gap})")
+    print("  [Lưu ý] Đây là lựa chọn HẬU NGHIỆM dựa trên kết quả của chính "
+          "tập kiểm tra\n  đang phân tích, không phải kết luận nhân quả và "
+          "cũng không phải kết quả của\n  một quy trình chọn mô hình trên "
+          "tập validation riêng. Khi báo cáo, nên trình\n  bày như 'cấu hình "
+          "cho kết quả tốt nhất trong thực nghiệm này', không phải\n  'cấu "
+          "hình được khuyến nghị cho triển khai thực tế'.\n")
 
     tab = (results[results.feature_set == "full"]
            .groupby("model", as_index=False)
@@ -552,7 +564,10 @@ def _seed_stability(results: pd.DataFrame, out_dir: Path, gap: int) -> None:
         print(f"  Δ trung bình     : {s['delta_mean']:+.4f}")
         print(f"  σ giữa các seed  : {s['delta_std']:.4f}")
         print(f"  |Δ| / σ          : {s['delta_over_std']:.1f}")
-        print(f"  >>> Kết luận theo quy tắc đã khai báo trước: {s['verdict']}")
+        print(f"  >>> Kết luận (dựa trên tỷ lệ {s['n_wins_b']}/{s['n_seeds']} "
+              f"seed đồng thuận chiều thắng): {s['verdict']}")
+        print(f"      (|Δ|/σ = {s['delta_over_std']:.1f} là chỉ báo ĐỘ LỚN "
+              f"riêng biệt, không phải căn cứ của kết luận trên)")
 
         s.update({"model_a": model_a, "model_b": model_b, "label": label})
         rows_summary.append(s)
@@ -561,6 +576,41 @@ def _seed_stability(results: pd.DataFrame, out_dir: Path, gap: int) -> None:
         pd.DataFrame(rows_summary).to_csv(
             out_dir / "seed_stability.csv", index=False)
         print(f"\nĐã lưu: {out_dir / 'seed_stability.csv'}")
+
+
+def _print_rq3_table(full: pd.DataFrame, pair: tuple[str, str],
+                     title: str, out_path: Path) -> pd.DataFrame:
+    """In và lưu bảng RQ3 cho một cặp (Single-Stage, Two-Stage) cho trước.
+
+    Tách thành hàm dùng chung để Bảng A (cố định) và Bảng B (khám phá) có
+    cùng định dạng, cùng logic tính cột chênh lệch — chỉ khác cách hai mô
+    hình trong cặp được chọn ra từ trước.
+    """
+    a, b = pair
+    print(f"\n[{title}]")
+    print(f"  {a}  vs  {b}")
+
+    pivot = (full.pivot_table(index="pattern", columns="model",
+                              values="wape", aggfunc="mean").round(4))
+    cols = [c for c in ["Croston", "SBA", "TSB", a, b] if c in pivot.columns]
+    pivot = pivot[cols]
+
+    if a in pivot.columns and b in pivot.columns:
+        pivot["Two−Single"] = (pivot[b] - pivot[a]).round(4)
+        pivot["Two thắng?"] = np.where(pivot["Two−Single"] < 0, "có", "không")
+
+    ref_rows = full[full.model == b]
+    info = (ref_rows.groupby("pattern")[["n_series", "zero_rate"]]
+           .mean().round(4)) if len(ref_rows) else pd.DataFrame()
+    out = info.join(pivot) if len(info) else pivot
+    order_p = ["Smooth", "Erratic", "Intermittent", "Lumpy"]
+    out = out.reindex([p for p in order_p if p in out.index])
+
+    print(out.to_string())
+    print("  Cột 'Two−Single' âm nghĩa là khung hai giai đoạn tốt hơn ở "
+          "nhóm đó.")
+    out.to_csv(out_path)
+    return out
 
 
 def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
@@ -627,15 +677,29 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
           "từng fold. Không dùng làm đặc trưng đầu vào.")
     full = strat[strat.feature_set.isin(["full", "-"])]
 
-    # So sánh biến thể TỐT NHẤT của mỗi kiến trúc, không phải bản mặc định.
-    # Dùng bản mặc định sẽ đánh giá thấp kiến trúc nào có cấu hình mặc định
-    # kém hơn, và câu trả lời cho RQ3 khi ấy phản ánh lựa chọn siêu tham số
-    # chứ không phải bản chất kiến trúc.
-    # Chọn biến thể tốt nhất của mỗi kiến trúc, nhưng chỉ trong số những
-    # biến thể có độ chệch chấp nhận được. Nếu xếp hạng thuần theo WAPE, ta sẽ
-    # chọn phải các biến thể dùng sai số tuyệt đối — vốn đứng đầu bảng WAPE
-    # nhờ dự báo thiếu — và câu trả lời cho RQ3 khi ấy phản ánh mức độ chệch
-    # chứ không phải ưu thế của kiến trúc.
+    # ---- BẢNG A (CHÍNH): cặp CỐ ĐỊNH, khai báo trước khi xem kết quả ----
+    # Đây là cấu hình mặc định của mỗi kiến trúc TỪ TRƯỚC khi bắt đầu điều
+    # tra hàm mất mát (Single-Stage = Tweedie, Two-Stage = squared) — lựa
+    # chọn dựa trên lý do miền dữ liệu (Tweedie cho hồi quy có khối xác suất
+    # tại không; squared là mặc định thông thường cho hồi quy), KHÔNG dựa
+    # trên việc đã xem kết quả test của nghiên cứu này. Đây là phép so sánh
+    # xác nhận (confirmatory) đúng nghĩa cho RQ3.
+    fixed_pair = ("Single-Stage", "Two-Stage")
+    if all(m in set(full.model) for m in fixed_pair):
+        _print_rq3_table(
+            full, fixed_pair,
+            title="BẢNG A (CHÍNH, xác nhận) — cặp cố định khai báo trước, "
+                  "không phụ thuộc kết quả test",
+            out_path=out_dir / "rq3_fixed_pair_by_pattern.csv")
+
+    # ---- BẢNG B (PHỤ, khám phá): biến thể tốt nhất chọn SAU khi xem test ----
+    # Cảnh báo phương pháp: biến thể "tốt nhất" của mỗi kiến trúc được chọn
+    # bằng WAPE/độ chệch tính trên CHÍNH tập kiểm tra dùng để phân tích dưới
+    # đây. Đây là một dạng "nhìn kết quả rồi chọn nhà vô địch, rồi phân tích
+    # tiếp trên chính kết quả đó" — không phải leakage (không mô hình nào
+    # huấn luyện trên dữ liệu kiểm tra), nhưng khiến bảng này mang tính khám
+    # phá (exploratory) chứ không phải xác nhận (confirmatory). Không dùng
+    # bảng này làm bằng chứng chính cho RQ3; chỉ dùng Bảng A cho việc đó.
     best = {}
     if "arch" in full.columns and "bias_ratio" in full.columns:
         for arch in ("Single-Stage", "Two-Stage"):
@@ -646,39 +710,66 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
                 wape=("wape", "mean"), bias=("bias_ratio", "mean"))
             ok = agg[agg.bias.between(0.95, 1.05)]
             best[arch] = (ok if len(ok) else agg).wape.idxmin()
-        if best:
-            print("  Biến thể tốt nhất của mỗi kiến trúc "
-                  "(đã loại biến thể lệch quá 5%):")
-            for k, v in best.items():
-                b = full[full.model == v]["bias_ratio"].mean()
-                print(f"    {k:<14} -> {v:<26} (độ chệch {b:.3f})")
-            print()
-
-    pivot = (full.pivot_table(index="pattern", columns="model",
-                              values="wape", aggfunc="mean").round(4))
-    keep = ["Croston", "SBA", "TSB"] + list(best.values())
-    cols = [c for c in dict.fromkeys(keep) if c in pivot.columns]
-    pivot = pivot[cols]
-
-    if len(best) == 2:
-        a, b = best["Single-Stage"], best["Two-Stage"]
-        pivot["Two−Single"] = (pivot[b] - pivot[a]).round(4)
-        pivot["Two thắng?"] = np.where(pivot["Two−Single"] < 0, "có", "không")
 
     _summarise.best_pair = (best.get("Single-Stage"), best.get("Two-Stage"))
-    ref_model = best.get("Two-Stage", "Two-Stage")
-    info = (full[full.model == ref_model]
-            .groupby("pattern")[["n_series", "zero_rate"]].mean().round(4))
-    out = info.join(pivot)
-    order_p = ["Smooth", "Erratic", "Intermittent", "Lumpy"]
-    out = out.reindex([p for p in order_p if p in out.index])
 
-    print(out.to_string())
-    print("\n  Cột 'Two−Single' âm nghĩa là khung hai giai đoạn tốt hơn ở "
-          "nhóm đó.\n  Đây chính là câu trả lời cho RQ3.")
-    out.to_csv(out_dir / "rq3_model_by_pattern.csv")
+    if len(best) == 2:
+        print("\n  Biến thể tốt nhất của mỗi kiến trúc theo test set "
+              "(đã loại biến thể lệch quá 5%):")
+        for k, v in best.items():
+            b = full[full.model == v]["bias_ratio"].mean()
+            print(f"    {k:<14} -> {v:<26} (độ chệch {b:.3f})")
+        _print_rq3_table(
+            full, (best["Single-Stage"], best["Two-Stage"]),
+            title="BẢNG B (PHỤ, khám phá — KHÔNG dùng làm bằng chứng chính) "
+                  "— biến thể chọn sau khi xem test",
+            out_path=out_dir / "rq3_exploratory_best_by_pattern.csv")
 
     print(f"\nKết quả lưu tại: {out_dir}")
+
+
+def _rq3_significance(losses: pd.DataFrame, series: pd.DataFrame,
+                      pair: tuple[str, str], out_dir: Path,
+                      title: str, filename: str,
+                      caveat: str | None = None) -> None:
+    """Kiểm định RQ3 theo từng nhóm nhu cầu cho một cặp mô hình cho trước.
+
+    Tách thành hàm dùng chung để cặp cố định (xác nhận) và cặp chọn sau khi
+    xem test (khám phá) có cùng định dạng, chỉ khác nhãn và cảnh báo kèm
+    theo — giúp người đọc so sánh trực tiếp hai kết quả và tự thấy chênh
+    lệch giữa chúng, thay vì chỉ được đưa một con số duy nhất.
+    """
+    a_model, b_model = pair
+    a_key, b_key = f"{a_model}|full", f"{b_model}|full"
+    keys = set(losses.model_key)
+    if a_key not in keys or b_key not in keys:
+        return
+
+    print("\n" + "-" * 72)
+    print(f"  {title}")
+    print(f"  {a_key}  vs  {b_key}")
+    if caveat:
+        print(f"  [CẢNH BÁO] {caveat}")
+    print("-" * 72)
+
+    by_pat = significance.compare_by_pattern(losses, series, a_key, b_key)
+    if not len(by_pat):
+        return
+
+    show = by_pat[["pattern", "n_series", "mean_diff", "b_win_rate",
+                   "p_wilcoxon", "cohen_d", "độ_lớn", "ý_nghĩa"]].rename(
+        columns={"mean_diff": "chênh_MAE", "b_win_rate": "tỷ_lệ_thắng"})
+    print(show.round(5).to_string(index=False))
+    print("\n  chênh_MAE dương nghĩa là khung hai giai đoạn tốt hơn "
+          "trong nhóm đó.")
+    print("  tỷ_lệ_thắng là tỷ lệ chuỗi mà khung hai giai đoạn thắng.")
+    print("  Cột ý_nghĩa đã hiệu chỉnh Holm cho bốn nhóm.")
+
+    won = by_pat[(by_pat.mean_diff > 0) & by_pat.reject_holm]
+    print(f"\n  Khung hai giai đoạn thắng có ý nghĩa ở "
+          f"{len(won)}/{len(by_pat)} nhóm"
+          + (f": {', '.join(won.pattern)}" if len(won) else ""))
+    by_pat.to_csv(out_dir / filename, index=False)
 
 
 def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
@@ -697,7 +788,14 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
     best = (results.groupby(["model", "feature_set"])["wape"].mean()
             .idxmin())
     reference = f"{best[0]}|{best[1]}"
-    print(f"  Mô hình tham chiếu: {reference}\n")
+    print(f"  Mô hình tham chiếu: {reference}")
+    print("  [CẢNH BÁO] Mô hình tham chiếu này được chọn bằng WAPE tính trên")
+    print("  CHÍNH tập kiểm tra đang phân tích, không phải trên tập validation")
+    print("  riêng. Việc so mọi mô hình khác với 'người thắng' xác định từ")
+    print("  cùng dữ liệu khiến giá trị p ở bảng dưới lạc quan hơn thực tế.")
+    print("  Bảng này dùng để XẾP HẠNG và mô tả, không dùng làm bằng chứng")
+    print("  xác nhận cho giả thuyết nào. Bằng chứng xác nhận cho RQ1 nằm ở")
+    print("  các cặp khớp chính xác hàm mất mát bên dưới.\n")
 
     table = significance.compare_all(losses, reference)
     if not len(table):
@@ -782,36 +880,36 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
             out_dir / "significance_rq1.csv", index=False)
 
     # ---- Kiểm định riêng trong từng nhóm mẫu nhu cầu (RQ3) ----
-    if series is not None and best_pair and all(best_pair):
-        a_model, b_model = best_pair
-        a_key, b_key = f"{a_model}|full", f"{b_model}|full"
-        keys = set(losses.model_key)
-        if a_key in keys and b_key in keys:
-            print("\n" + "-" * 72)
-            print("  RQ3 — kiểm định riêng trong từng nhóm mẫu nhu cầu")
-            print(f"  {a_key}  vs  {b_key}")
-            print("-" * 72)
+    #
+    # Chạy HAI lần, tách bạch đúng như Bảng A/Bảng B ở phần mô tả:
+    #
+    #   Cặp cố định (chính, xác nhận) — Single-Stage vs Two-Stage mặc định,
+    #       khai báo trước khi xem kết quả test. Đây là cặp duy nhất mà
+    #       p-value và độ lớn hiệu ứng diễn giải được theo nghĩa suy luận
+    #       thống kê thông thường.
+    #
+    #   Cặp chọn sau khi xem test (phụ, khám phá) — biến thể "tốt nhất" của
+    #       mỗi kiến trúc được chọn bằng WAPE/độ chệch tính trên CHÍNH tập
+    #       kiểm tra này. Kiểm định trên cặp đó là kiểm định trên giả thuyết
+    #       sinh ra từ dữ liệu, nên p-value bị lạc quan và KHÔNG được trình
+    #       bày như bằng chứng xác nhận.
+    if series is not None:
+        fixed_pair = ("Single-Stage", "Two-Stage")
+        _rq3_significance(
+            losses, series, fixed_pair, out_dir,
+            title="RQ3 (CHÍNH, xác nhận) — cặp cố định khai báo trước",
+            filename="significance_rq3_fixed_pair.csv",
+            caveat=None)
 
-            by_pat = significance.compare_by_pattern(
-                losses, series, a_key, b_key)
-            if len(by_pat):
-                show = by_pat[["pattern", "n_series", "mean_diff",
-                               "b_win_rate", "p_wilcoxon", "cohen_d",
-                               "độ_lớn", "ý_nghĩa"]].rename(columns={
-                    "mean_diff": "chênh_MAE", "b_win_rate": "tỷ_lệ_thắng"})
-                print(show.round(5).to_string(index=False))
-                print("\n  chênh_MAE dương nghĩa là khung hai giai đoạn tốt "
-                      "hơn trong nhóm đó.")
-                print("  tỷ_lệ_thắng là tỷ lệ chuỗi mà khung hai giai đoạn "
-                      "thắng.")
-                print("  Cột ý_nghĩa đã hiệu chỉnh Holm cho bốn nhóm.")
-
-                won = by_pat[(by_pat.mean_diff > 0) & by_pat.reject_holm]
-                print(f"\n  Khung hai giai đoạn thắng có ý nghĩa ở "
-                      f"{len(won)}/{len(by_pat)} nhóm"
-                      + (f": {', '.join(won.pattern)}" if len(won) else ""))
-                by_pat.to_csv(out_dir / "significance_rq3_by_pattern.csv",
-                              index=False)
+        if best_pair and all(best_pair) and tuple(best_pair) != fixed_pair:
+            _rq3_significance(
+                losses, series, tuple(best_pair), out_dir,
+                title="RQ3 (PHỤ, khám phá) — cặp chọn SAU khi xem test",
+                filename="significance_rq3_exploratory.csv",
+                caveat="Cặp này được chọn dựa trên kết quả của chính tập "
+                       "kiểm tra đang phân tích.\n      Giá trị p ở đây "
+                       "lạc quan hơn thực tế và KHÔNG dùng làm bằng chứng "
+                       "xác nhận.")
 
     print(f"\n  Đã lưu kết quả kiểm định vào {out_dir}")
 
