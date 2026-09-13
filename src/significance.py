@@ -7,19 +7,20 @@ Chênh lệch WAPE giữa các mô hình trong nghiên cứu này chỉ vào kho
 thật hay chỉ là dao động ngẫu nhiên của mẫu. Phản biện sẽ hỏi ngay câu này, và
 câu trả lời phải là một kiểm định chứ không phải một bảng số trung bình.
 
-Ba lớp bằng chứng
------------------
-1. ``diebold_mariano`` — kiểm định chuẩn mực trong tài liệu dự báo, so sánh
-   chuỗi chênh lệch hàm mất mát theo thời gian, có hiệu chỉnh tự tương quan.
+Hai lớp bằng chứng
+------------------
+1. ``paired_test_by_series`` — với hơn hai mươi nghìn chuỗi, kiểm định theo
+   cặp trên từng chuỗi có lực mạnh và ít giả định. Báo cáo cả kiểm định t lẫn
+   kiểm định dấu hạng Wilcoxon: cái sau không giả định phân phối chuẩn, phù
+   hợp hơn với phân bố chênh lệch lệch mạnh. Kèm theo độ lớn hiệu ứng
+   (Cohen's d) và tỷ lệ thắng, vì với cỡ mẫu này giá trị p gần như luôn đạt
+   ngưỡng ý nghĩa và không còn phân biệt được khác biệt đáng kể trong thực tế.
 
-2. ``paired_test_by_series`` — với hơn hai mươi nghìn chuỗi độc lập, kiểm định
-   theo cặp trên từng chuỗi có lực mạnh hơn và ít giả định hơn. Báo cáo cả
-   kiểm định t lẫn kiểm định dấu hạng Wilcoxon: cái sau không giả định phân
-   phối chuẩn, phù hợp hơn với phân bố chênh lệch lệch mạnh.
-
-3. ``holm_correction`` — khi so sánh nhiều cặp mô hình, xác suất có ít nhất một
+2. ``holm_correction`` — khi so sánh nhiều cặp mô hình, xác suất có ít nhất một
    kết luận sai tăng nhanh theo số phép so sánh. Hiệu chỉnh Holm khắc phục
-   điều này mà vẫn giữ được lực kiểm định tốt hơn Bonferroni thuần.
+   điều này mà vẫn giữ được lực kiểm định tốt hơn Bonferroni thuần. Áp dụng
+   trong TỪNG họ giả thuyết tương ứng một câu hỏi nghiên cứu, không gộp chung
+   toàn bộ phép so sánh của cả bài.
 """
 
 from __future__ import annotations
@@ -29,80 +30,6 @@ import pandas as pd
 from scipy import stats
 
 KEYS = ["store_nbr", "item_nbr"]
-
-
-# --------------------------------------------------------------------------- #
-# Diebold-Mariano
-# --------------------------------------------------------------------------- #
-def diebold_mariano(errors_a: np.ndarray, errors_b: np.ndarray,
-                    horizon: int = 1, power: int = 1,
-                    small_sample_correction: bool = True) -> dict:
-    """Kiểm định Diebold-Mariano so sánh độ chính xác của hai dự báo.
-
-    Giả thuyết không là hai mô hình có độ chính xác kỳ vọng như nhau. Thống kê
-    kiểm định dựa trên chuỗi chênh lệch hàm mất mát; phương sai được ước lượng
-    bằng phương pháp nhất quán với tự tương quan, vì dự báo nhiều bước trước
-    tạo ra sai số tương quan tới ``horizon - 1`` độ trễ.
-
-    Áp dụng hiệu chỉnh mẫu nhỏ của Harvey, Leybourne và Newbold, vì thống kê
-    gốc có xu hướng bác bỏ quá dễ khi mẫu ngắn.
-
-    Parameters
-    ----------
-    power : int
-        Bậc của hàm mất mát. ``1`` cho sai số tuyệt đối, phù hợp khi chỉ số
-        đánh giá là WAPE; ``2`` cho sai số bình phương.
-
-    Returns
-    -------
-    dict với thống kê kiểm định, giá trị p, và dấu hiệu mô hình nào tốt hơn.
-    """
-    d = np.abs(errors_a) ** power - np.abs(errors_b) ** power
-    d = d[np.isfinite(d)]
-    n = len(d)
-    if n < 10:
-        return {"dm_stat": np.nan, "p_value": np.nan, "n": n,
-                "better": "không đủ dữ liệu"}
-
-    d_bar = float(np.mean(d))
-
-    # Hai dự báo trùng khớp hoàn toàn: kết luận là không khác biệt, chứ không
-    # phải lỗi tính toán. Tách riêng trường hợp này trước khi chia cho phương
-    # sai, vì phương sai khi đó bằng không.
-    if np.allclose(d, 0.0):
-        return {"dm_stat": 0.0, "p_value": 1.0, "n": n,
-                "mean_loss_diff": 0.0, "better": "không khác biệt"}
-
-    # Phương sai dài hạn: cộng thêm các hiệp phương sai trễ vì sai số dự báo
-    # nhiều bước trước có tương quan với nhau
-    gamma0 = float(np.mean((d - d_bar) ** 2))
-    var = gamma0
-    for lag in range(1, horizon):
-        if lag >= n:
-            break
-        cov = float(np.mean((d[lag:] - d_bar) * (d[:-lag] - d_bar)))
-        var += 2 * cov
-
-    if var <= 0:
-        return {"dm_stat": np.nan, "p_value": np.nan, "n": n,
-                "better": "phương sai không hợp lệ"}
-
-    dm = d_bar / np.sqrt(var / n)
-
-    if small_sample_correction and horizon > 1:
-        adj = np.sqrt((n + 1 - 2 * horizon + horizon * (horizon - 1) / n) / n)
-        dm *= adj
-
-    df = max(n - 1, 1)
-    p = float(2 * (1 - stats.t.cdf(abs(dm), df=df)))
-
-    return {
-        "dm_stat": float(dm),
-        "p_value": p,
-        "n": n,
-        "mean_loss_diff": d_bar,
-        "better": ("B" if d_bar > 0 else "A") if p < 0.05 else "không khác biệt",
-    }
 
 
 # --------------------------------------------------------------------------- #

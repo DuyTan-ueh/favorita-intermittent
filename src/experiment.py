@@ -430,8 +430,16 @@ def _matched_loss_comparison(results: pd.DataFrame, out_dir: Path,
       Khớp chính xác (exact match)
           Hai kiến trúc dùng ĐÚNG cùng một hàm mất mát
           (``squared`` với ``squared``, ``absolute`` với ``absolute``).
-          Đây là so sánh sạch nhất: mọi chênh lệch quan sát được chỉ có thể
-          đến từ kiến trúc, không thể đến từ hàm mất mát.
+          Hàm mất mát được giữ cố định, nên cách so sánh này cô lập ảnh
+          hưởng của kiến trúc chặt hơn mọi cặp khác trong nghiên cứu.
+
+          Cần nói đúng mức: điều này KHÔNG có nghĩa mọi chênh lệch quan sát
+          được đều quy về kiến trúc. Hai nhánh vẫn khác nhau ở những điểm
+          khác — số lượng mô hình được huấn luyện, tập quan sát mà từng mô
+          hình nhìn thấy (giai đoạn hai chỉ học trên y>0), cách tính dự báo
+          cuối, và nhiễu ngẫu nhiên của quá trình huấn luyện. Diễn đạt an
+          toàn là "giữ cố định hàm mất mát giúp cô lập ảnh hưởng của kiến
+          trúc chặt hơn", không phải "chênh lệch hoàn toàn do kiến trúc".
 
       Tương đồng phân phối (distributional analogy), KHÔNG phải khớp chính xác
           Tweedie (Single-Stage) và Gamma (Two-Stage) là hai hàm mất mát
@@ -486,9 +494,10 @@ def _matched_loss_comparison(results: pd.DataFrame, out_dir: Path,
     if rows:
         pd.DataFrame(rows).to_csv(
             out_dir / "matched_loss_comparison.csv", index=False)
-        print("\n  Chỉ hai bảng 'KHỚP CHÍNH XÁC' mới cho phép quy chênh lệch")
-        print("  hoàn toàn cho kiến trúc. Bảng 'TƯƠNG ĐỒNG PHÂN PHỐI' trả lời")
-        print("  một câu hỏi khác (đã nêu trong docstring) và không nên gọi")
+        print("\n  Hai bảng 'KHỚP CHÍNH XÁC' giữ cố định hàm mất mát, nên cô")
+        print("  lập ảnh hưởng của kiến trúc chặt hơn — KHÔNG đồng nghĩa mọi")
+        print("  chênh lệch đều do kiến trúc (xem docstring). Bảng 'TƯƠNG")
+        print("  ĐỒNG PHÂN PHỐI' trả lời một câu hỏi khác và không nên gọi")
         print("  là 'matched loss' trong bài viết.")
 
 
@@ -565,7 +574,7 @@ def _seed_stability(results: pd.DataFrame, out_dir: Path, gap: int) -> None:
 
     Thứ tự ưu tiên ở đây PHẢI khớp với cách phân loại đã dùng ở
     ``_matched_loss_comparison`` và ``_run_significance``: cặp khớp chính xác
-    (cùng hàm mất mát) là phép so sánh kiến trúc sạch nhất nên đặt lên đầu;
+    (cùng hàm mất mát) cô lập ảnh hưởng của kiến trúc chặt hơn nên đặt lên đầu;
     cặp Tweedie/Gamma chỉ là tương đồng phân phối, đặt sau và gắn nhãn rõ để
     không bị hiểu nhầm là "câu hỏi trung tâm" của RQ1.
 
@@ -694,17 +703,52 @@ def _print_rq3_table(full: pd.DataFrame, pair: tuple[str, str],
 def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
                out_dir: Path, gap: int) -> None:
     """In các bảng tổng hợp tương ứng từng câu hỏi nghiên cứu."""
+    # RMSSE loại bỏ những chuỗi không có hệ số chuẩn hoá hợp lệ (chuỗi huấn
+    # luyện không đủ biến thiên). ``metrics.py`` đã đếm sẵn nhưng trước đây
+    # không đưa ra bảng tổng hợp, nên người đọc không biết RMSSE được tính
+    # trên bao nhiêu chuỗi. Báo cáo tường minh: nếu số bị loại bằng 0 thì
+    # nhìn vào là biết ngay RMSSE không mất mẫu.
+    agg_spec = dict(
+        wape=("wape", "mean"), mae=("mae", "mean"),
+        rmse=("rmse", "mean"), rmsse=("rmsse", "mean"),
+        bias=("bias_ratio", "mean"),
+        near_zero=("near_zero_rate", "mean"),
+        seconds=("seconds", "mean"))
+    for col in ("rmsse_n_series", "rmsse_n_excluded"):
+        if col in results.columns:
+            agg_spec[col] = (col, "mean")
+
     agg = (results.groupby(["model", "feature_set"], as_index=False)
-           .agg(wape=("wape", "mean"), mae=("mae", "mean"),
-                rmse=("rmse", "mean"), rmsse=("rmsse", "mean"),
-                bias=("bias_ratio", "mean"),
-                near_zero=("near_zero_rate", "mean"),
-                seconds=("seconds", "mean"))
+           .agg(**agg_spec)
            .sort_values("wape"))
+
+    if "rmsse_n_series" in agg.columns and "rmsse_n_excluded" in agg.columns:
+        total = agg.rmsse_n_series + agg.rmsse_n_excluded
+        agg["rmsse_exclusion_rate"] = (
+            agg.rmsse_n_excluded / total.replace(0, np.nan)).round(4)
+
     agg.to_csv(out_dir / "summary.csv", index=False)
 
     _banner(f"RQ1 — SO SÁNH MÔ HÌNH (gap={gap}, trung bình các fold)")
-    print(agg.round(4).to_string(index=False))
+    # Giữ bảng chính gọn để dễ đọc; số liệu về độ phủ RMSSE in riêng bên dưới
+    # và luôn có đủ trong summary.csv.
+    audit_cols = {"rmsse_n_series", "rmsse_n_excluded", "rmsse_exclusion_rate"}
+    main_cols = [c for c in agg.columns if c not in audit_cols]
+    print(agg[main_cols].round(4).to_string(index=False))
+
+    if "rmsse_n_excluded" in agg.columns:
+        n_excl = float(agg.rmsse_n_excluded.mean())
+        n_kept = float(agg.rmsse_n_series.mean())
+        if n_excl <= 0:
+            print(f"\n  RMSSE tính trên toàn bộ {n_kept:,.0f} chuỗi — không "
+                  f"chuỗi nào bị loại.")
+        else:
+            rate = n_excl / (n_excl + n_kept) if (n_excl + n_kept) else float("nan")
+            print(f"\n  [LƯU Ý] RMSSE tính trên {n_kept:,.0f} chuỗi; "
+                  f"{n_excl:,.0f} chuỗi bị loại ({rate:.2%}) do chuỗi huấn "
+                  f"luyện\n  không đủ biến thiên để có hệ số chuẩn hoá hợp "
+                  f"lệ. Con số này cần nêu khi\n  báo cáo RMSSE — xem cột "
+                  f"rmsse_n_* trong summary.csv.")
 
     _seed_stability(results, out_dir, gap)
     _bias_diagnostics(results, gap)
@@ -983,7 +1027,7 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
     print("\n  RQ1 — so sánh ghép cặp, tách theo mức độ khớp hàm mất mát:")
     all_rows = []
     for r in _print_group(
-            "KHỚP CHÍNH XÁC — mọi chênh lệch quy được cho kiến trúc",
+            "KHỚP CHÍNH XÁC — hàm mất mát cố định, cô lập kiến trúc chặt hơn",
             exact_match_pairs):
         r["category"] = "exact_match"
         all_rows.append(r)

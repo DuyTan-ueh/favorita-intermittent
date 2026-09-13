@@ -375,23 +375,6 @@ class TestBaselines:
 # Kiểm định thống kê
 # --------------------------------------------------------------------------- #
 class TestSignificance:
-    def test_dm_detects_clear_difference(self):
-        """Khi mô hình A tệ hơn hẳn, DM phải bác bỏ giả thuyết không."""
-        from src.significance import diebold_mariano
-        rng = np.random.default_rng(0)
-        err_a = rng.normal(0, 3.0, 500)     # sai số lớn
-        err_b = rng.normal(0, 1.0, 500)     # sai số nhỏ
-        res = diebold_mariano(err_a, err_b, horizon=7)
-        assert res["p_value"] < 0.01
-        assert res["better"] == "B"
-
-    def test_dm_no_difference_when_identical(self):
-        from src.significance import diebold_mariano
-        rng = np.random.default_rng(1)
-        e = rng.normal(0, 1.0, 500)
-        res = diebold_mariano(e, e.copy(), horizon=7)
-        assert res["better"] == "không khác biệt"
-
     def test_holm_is_more_conservative_than_raw(self):
         """Hiệu chỉnh Holm phải loại bớt kết luận so với ngưỡng thô."""
         from src.significance import holm_correction
