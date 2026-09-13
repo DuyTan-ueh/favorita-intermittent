@@ -1240,3 +1240,130 @@ class TestRQ3SignificancePairSeparation:
         _rq3_significance(losses, series, ("Không-có", "Two-Stage"),
                           tmp_path, title="X", filename="none.csv")
         assert not (tmp_path / "none.csv").exists()
+
+
+# --------------------------------------------------------------------------- #
+# Cặp cố định RQ3 phải KHỚP hàm mất mát
+# --------------------------------------------------------------------------- #
+class TestRQ3FixedPairIsMatchedLoss:
+    """Khoá lại lỗi thiết kế: cặp CHÍNH của RQ3 từng là Tweedie vs squared.
+
+    Cặp đó cố định thật (khai báo trước khi xem test) nhưng kiến trúc và hàm
+    mất mát thay đổi cùng lúc, nên chênh lệch không quy về riêng kiến trúc
+    được — mâu thuẫn với chính cảnh báo mà phần RQ1 đưa ra. Nay cặp chính
+    phải khớp hàm mất mát (squared vs squared).
+    """
+
+    @staticmethod
+    def _results(single_loss: str, two_loss: str) -> pd.DataFrame:
+        return pd.DataFrame([
+            {"model": "Single-Stage[squared]", "arch": "Single-Stage",
+             "loss": single_loss, "feature_set": "full", "wape": 0.516},
+            {"model": "Two-Stage", "arch": "Two-Stage",
+             "loss": two_loss, "feature_set": "full", "wape": 0.515},
+        ])
+
+    def test_default_fixed_pair_is_not_the_old_mismatched_pair(self):
+        from src.experiment import RQ3_FIXED_PAIR
+        assert RQ3_FIXED_PAIR != ("Single-Stage", "Two-Stage")
+        assert RQ3_FIXED_PAIR == ("Single-Stage[squared]", "Two-Stage")
+
+    def test_matched_pair_passes_check(self):
+        from src.experiment import RQ3_FIXED_PAIR, _assert_rq3_pair_matched
+        res = self._results("squared", "squared")
+        assert _assert_rq3_pair_matched(res, RQ3_FIXED_PAIR) is True
+
+    def test_mismatched_pair_is_detected_and_warns(self, capsys):
+        """Đổi thứ tự stage2_objectives làm nhãn 'Two-Stage' trỏ sang hàm mất
+        mát khác — phải bị phát hiện, không được im lặng."""
+        from src.experiment import RQ3_FIXED_PAIR, _assert_rq3_pair_matched
+        res = self._results("squared", "gamma")
+        assert _assert_rq3_pair_matched(res, RQ3_FIXED_PAIR) is False
+        out = capsys.readouterr().out
+        assert "CẢNH BÁO" in out and "squared" in out and "gamma" in out
+
+    def test_check_is_silent_when_loss_column_absent(self):
+        """Checkpoint cũ không có cột 'loss' — không được báo động giả."""
+        from src.experiment import RQ3_FIXED_PAIR, _assert_rq3_pair_matched
+        res = pd.DataFrame([{"model": "Two-Stage", "wape": 0.5}])
+        assert _assert_rq3_pair_matched(res, RQ3_FIXED_PAIR) is True
+
+
+class TestPValueReporting:
+    """p = 0.0 là kết quả của giới hạn số học, không phải xác suất bằng 0."""
+
+    def test_zero_p_is_reported_as_upper_bound(self):
+        from src.experiment import _fmt_p
+        out = _fmt_p(0.0)
+        assert out.startswith("<")
+        assert out != "0.0000"
+
+    def test_nan_p_is_labelled(self):
+        from src.experiment import _fmt_p
+        assert _fmt_p(float("nan")) == "n/a"
+
+    def test_ordinary_p_still_readable(self):
+        from src.experiment import _fmt_p
+        assert _fmt_p(0.0432) == "0.0432"
+
+    def test_tiny_but_representable_p_uses_scientific_notation(self):
+        from src.experiment import _fmt_p
+        assert "e-" in _fmt_p(6.653e-120)
+
+
+class TestRQ3DirectionalSummary:
+    """'Không thắng' khác 'không có khác biệt'.
+
+    Bản trước chỉ đếm số nhóm thắng có ý nghĩa rồi in 'thắng ở 1/4 nhóm',
+    gộp chung nhóm THUA có ý nghĩa với nhóm không có khác biệt.
+    """
+
+    @staticmethod
+    def _losses(b_is_worse: bool):
+        rng = np.random.default_rng(11)
+        n = 300
+        base = rng.gamma(2, 1, n)
+        penalty = 0.8 if b_is_worse else -0.8
+        frames = [
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "Single-Stage[squared]|full",
+                          "fold": 0, "mae": base}),
+            pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                          "model_key": "Two-Stage|full",
+                          "fold": 0, "mae": base + penalty}),
+        ]
+        losses = pd.concat(frames, ignore_index=True)
+        series = pd.DataFrame({"store_nbr": 1, "item_nbr": np.arange(n),
+                               "pattern": "Erratic"})
+        return losses, series
+
+    def test_two_stage_losing_is_reported_as_losing_not_as_no_difference(
+            self, tmp_path, capsys):
+        from src.experiment import _rq3_significance
+        losses, series = self._losses(b_is_worse=True)
+        _rq3_significance(losses, series,
+                          ("Single-Stage[squared]", "Two-Stage"),
+                          tmp_path, title="T", filename="f.csv")
+        out = capsys.readouterr().out
+        assert "KÉM HƠN có ý nghĩa : 1/1" in out
+        assert "TỐT HƠN có ý nghĩa : 0/1" in out
+
+    def test_two_stage_winning_still_reported_as_winning(
+            self, tmp_path, capsys):
+        from src.experiment import _rq3_significance
+        losses, series = self._losses(b_is_worse=False)
+        _rq3_significance(losses, series,
+                          ("Single-Stage[squared]", "Two-Stage"),
+                          tmp_path, title="T", filename="f.csv")
+        out = capsys.readouterr().out
+        assert "TỐT HƠN có ý nghĩa : 1/1" in out
+        assert "KÉM HƠN có ý nghĩa : 0/1" in out
+
+    def test_summary_never_prints_p_equals_zero(self, tmp_path, capsys):
+        from src.experiment import _rq3_significance
+        losses, series = self._losses(b_is_worse=True)
+        _rq3_significance(losses, series,
+                          ("Single-Stage[squared]", "Two-Stage"),
+                          tmp_path, title="T", filename="f.csv")
+        out = capsys.readouterr().out
+        assert " 0.00000\n" not in out.replace("\r", "")

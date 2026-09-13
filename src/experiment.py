@@ -30,6 +30,48 @@ KEYS = ["store_nbr", "item_nbr"]
 NON_FEATURES = {"y", "y_occurrence", "y_magnitude", "date",
                 "store_nbr", "item_nbr"}
 
+# --------------------------------------------------------------------------- #
+# Cặp so sánh CỐ ĐỊNH của RQ3
+# --------------------------------------------------------------------------- #
+# Cặp này phải KHỚP CHÍNH XÁC hàm mất mát, nếu không RQ3 sẽ không trả lời được
+# câu hỏi nó tự đặt ra.
+#
+# Bản trước dùng ("Single-Stage", "Two-Stage") — hai nhãn mặc định. Cặp đó cố
+# định thật (khai báo trước khi xem kết quả test), nhưng "Single-Stage" mặc
+# định là Tweedie còn "Two-Stage" mặc định là squared, nên kiến trúc VÀ hàm
+# mất mát thay đổi cùng lúc. Chênh lệch quan sát được khi đó không quy về
+# riêng kiến trúc được — đúng thứ mà ``_matched_loss_comparison`` đã cảnh báo
+# ở phần RQ1, tạo ra mâu thuẫn nội bộ giữa hai mục của cùng một báo cáo.
+#
+# Chọn squared làm cặp chính (thay vì absolute) vì: độ chệch của cả hai mô
+# hình đều gần 1, nên hiệu ứng không bị bóp méo bởi hiện tượng dự báo thiếu
+# nặng vốn thấy ở nhóm absolute; và đây cũng chính là cặp đã được kiểm tra độ
+# ổn định qua nhiều seed ở ``_seed_stability``.
+#
+# LƯU Ý về quy ước đặt tên: ``run_fold`` gán nhãn ngắn "Two-Stage" cho phần tử
+# ĐẦU TIÊN của ``experiment.stage2_objectives`` (mặc định là ``squared``), và
+# "Single-Stage[squared]" cho biến thể squared của mô hình một giai đoạn. Nếu
+# đổi thứ tự ``stage2_objectives`` trong cấu hình thì nhãn "Two-Stage" sẽ trỏ
+# sang hàm mất mát khác và cặp dưới đây KHÔNG còn khớp — ``_assert_rq3_pair_
+# matched`` kiểm tra đúng tình huống đó và cảnh báo.
+RQ3_FIXED_PAIR = ("Single-Stage[squared]", "Two-Stage")
+
+# Giá trị p nhỏ hơn ngưỡng này bị làm tròn thành 0.0 do giới hạn số học dấu
+# phẩy động. In "p = 0" là sai về bản chất: xác suất không bằng không, chỉ là
+# nhỏ hơn mức biểu diễn được. Báo cáo dạng chặn trên thay vì con số bịa.
+P_UNDERFLOW = 1e-300
+
+
+def _fmt_p(p: float | None) -> str:
+    """Định dạng giá trị p, không bao giờ in 'p = 0'."""
+    if p is None or (isinstance(p, float) and np.isnan(p)):
+        return "n/a"
+    if p <= 0.0:
+        return f"<{P_UNDERFLOW:.0e}"
+    if p < 1e-4:
+        return f"{p:.2e}"
+    return f"{p:.4f}"
+
 
 def _banner(text: str) -> None:
     print(f"\n{'=' * 72}\n{text}\n{'=' * 72}")
@@ -578,6 +620,42 @@ def _seed_stability(results: pd.DataFrame, out_dir: Path, gap: int) -> None:
         print(f"\nĐã lưu: {out_dir / 'seed_stability.csv'}")
 
 
+def _assert_rq3_pair_matched(results: pd.DataFrame,
+                             pair: tuple[str, str]) -> bool:
+    """Xác minh cặp cố định của RQ3 thật sự dùng cùng một hàm mất mát.
+
+    Kiểm tra bằng dữ liệu thay vì tin vào tên nhãn. Nhãn ngắn "Two-Stage" trỏ
+    tới phần tử đầu tiên của ``stage2_objectives``, nên chỉ cần đổi thứ tự
+    trong cấu hình là cặp hết khớp mà không có dấu hiệu nào báo lỗi — đúng
+    dạng hỏng âm thầm mà toàn bộ phần kiểm định của repo này cố tránh.
+
+    Trả về True nếu khớp. Nếu không khớp thì in cảnh báo và trả về False, để
+    phần gọi quyết định có in bảng hay không — không tự ý im lặng bỏ qua.
+    """
+    if "loss" not in results.columns:
+        return True                      # không đủ thông tin để kết luận
+
+    a, b = pair
+    losses = {}
+    for m in pair:
+        vals = results[results.model == m]["loss"].dropna().unique()
+        if len(vals):
+            losses[m] = vals[0]
+
+    if len(losses) < 2:
+        return True                      # thiếu mô hình, xử lý ở chỗ khác
+
+    if losses[a] != losses[b]:
+        print(f"\n  [CẢNH BÁO] Cặp cố định của RQ3 KHÔNG khớp hàm mất mát: "
+              f"{a} dùng '{losses[a]}' còn {b} dùng '{losses[b]}'.")
+        print("  Chênh lệch quan sát được sẽ lẫn giữa kiến trúc và hàm mất "
+              "mát, nên\n  KHÔNG được diễn giải như một so sánh kiến trúc. "
+              "Kiểm tra thứ tự\n  'stage2_objectives' và "
+              "'single_stage_objectives' trong cấu hình.")
+        return False
+    return True
+
+
 def _print_rq3_table(full: pd.DataFrame, pair: tuple[str, str],
                      title: str, out_path: Path) -> pd.DataFrame:
     """In và lưu bảng RQ3 cho một cặp (Single-Stage, Two-Stage) cho trước.
@@ -655,9 +733,22 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
         print(f"\n[{model_name}]")
         print(ab.round(4).to_string(index=False))
 
-    print("\n  Đọc bảng: mỗi dòng thêm đúng một nhóm đặc trưng so với dòng "
-          "trên,\n  nên cột 'riêng_%' là đóng góp của riêng nhóm đó.")
-    print("  Dòng 'hist_cal_hol_promo' cô lập đóng góp của KHUYẾN MÃI.")
+    # Hướng dẫn đọc bảng chỉ đúng khi có nhiều bộ đặc trưng xếp chồng. Khi
+    # lượt chạy chỉ có một bộ (ví dụ Phase A chỉ chạy 'full'), in hướng dẫn
+    # về "đóng góp riêng của từng nhóm" là mô tả một thứ không tồn tại trong
+    # kết quả — dễ khiến người đọc tưởng RQ2 đã được trả lời.
+    if len(order) > 1:
+        print("\n  Đọc bảng: mỗi dòng thêm đúng một nhóm đặc trưng so với "
+              "dòng trên,\n  nên cột 'riêng_%' là đóng góp của riêng nhóm đó.")
+        if "hist_cal_hol_promo" in order:
+            print("  Dòng 'hist_cal_hol_promo' cô lập đóng góp của KHUYẾN MÃI.")
+    else:
+        only = order[0] if order else "(không có)"
+        print(f"\n  [RQ2 CHƯA ĐƯỢC TRẢ LỜI] lượt chạy này chỉ có một bộ đặc "
+              f"trưng: '{only}'.")
+        print("  Không có nghiên cứu loại trừ nên KHÔNG thể kết luận gì về "
+              "đóng góp của\n  từng nhóm đặc trưng. Muốn trả lời RQ2 phải "
+              "chạy nhiều bộ trong\n  'experiment.feature_sets' (Phase B).")
 
     occ = results[(results.model == "Two-Stage")].dropna(subset=["pr_auc"])
     if len(occ):
@@ -677,19 +768,24 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
           "từng fold. Không dùng làm đặc trưng đầu vào.")
     full = strat[strat.feature_set.isin(["full", "-"])]
 
-    # ---- BẢNG A (CHÍNH): cặp CỐ ĐỊNH, khai báo trước khi xem kết quả ----
-    # Đây là cấu hình mặc định của mỗi kiến trúc TỪ TRƯỚC khi bắt đầu điều
-    # tra hàm mất mát (Single-Stage = Tweedie, Two-Stage = squared) — lựa
-    # chọn dựa trên lý do miền dữ liệu (Tweedie cho hồi quy có khối xác suất
-    # tại không; squared là mặc định thông thường cho hồi quy), KHÔNG dựa
-    # trên việc đã xem kết quả test của nghiên cứu này. Đây là phép so sánh
-    # xác nhận (confirmatory) đúng nghĩa cho RQ3.
-    fixed_pair = ("Single-Stage", "Two-Stage")
-    if all(m in set(full.model) for m in fixed_pair):
+    # ---- BẢNG A (CHÍNH): cặp CỐ ĐỊNH, KHỚP hàm mất mát ----
+    # Cặp được cố định trước khi xem kết quả test VÀ dùng chung một hàm mất
+    # mát (xem chú thích ở ``RQ3_FIXED_PAIR``). Hai điều kiện này phải có đủ:
+    # cố định mà không khớp hàm mất mát thì vẫn không tách được ảnh hưởng của
+    # kiến trúc khỏi ảnh hưởng của hàm mất mát.
+    fixed_pair = RQ3_FIXED_PAIR
+    missing = [m for m in fixed_pair if m not in set(full.model)]
+    if missing:
+        print(f"\n  [BỎ QUA BẢNG A] thiếu mô hình {missing} trong kết quả.")
+        print("  Bảng A cần cặp khớp hàm mất mát; hãy bật 'squared' trong cả")
+        print("  'single_stage_objectives' lẫn 'stage2_objectives' rồi chạy "
+              "lại.\n  KHÔNG dùng Bảng B thay thế — đó là phân tích khám phá.")
+    else:
+        _assert_rq3_pair_matched(results, fixed_pair)
         _print_rq3_table(
             full, fixed_pair,
-            title="BẢNG A (CHÍNH, xác nhận) — cặp cố định khai báo trước, "
-                  "không phụ thuộc kết quả test",
+            title="BẢNG A (CHÍNH, xác nhận) — cặp cố định, KHỚP hàm mất mát "
+                  "(squared vs squared), không phụ thuộc kết quả test",
             out_path=out_dir / "rq3_fixed_pair_by_pattern.csv")
 
     # ---- BẢNG B (PHỤ, khám phá): biến thể tốt nhất chọn SAU khi xem test ----
@@ -759,16 +855,40 @@ def _rq3_significance(losses: pd.DataFrame, series: pd.DataFrame,
     show = by_pat[["pattern", "n_series", "mean_diff", "b_win_rate",
                    "p_wilcoxon", "cohen_d", "độ_lớn", "ý_nghĩa"]].rename(
         columns={"mean_diff": "chênh_MAE", "b_win_rate": "tỷ_lệ_thắng"})
-    print(show.round(5).to_string(index=False))
+    show = show.round(5)
+    show["p_wilcoxon"] = by_pat.p_wilcoxon.map(_fmt_p)
+    print(show.to_string(index=False))
     print("\n  chênh_MAE dương nghĩa là khung hai giai đoạn tốt hơn "
           "trong nhóm đó.")
     print("  tỷ_lệ_thắng là tỷ lệ chuỗi mà khung hai giai đoạn thắng.")
     print("  Cột ý_nghĩa đã hiệu chỉnh Holm cho bốn nhóm.")
 
+    # Tổng kết phải phân biệt BA tình huống, không phải hai.
+    #
+    # Bản trước chỉ đếm số nhóm "thắng có ý nghĩa" rồi in "thắng ở 1/4 nhóm".
+    # Câu đó khiến người đọc hiểu ba nhóm còn lại không có khác biệt, trong
+    # khi thực tế chúng có thể khác biệt có ý nghĩa theo chiều NGƯỢC LẠI —
+    # tức khung hai giai đoạn THUA. Gộp "thua có ý nghĩa" chung với "không
+    # khác biệt" là một sai sót diễn giải, không phải sai sót tính toán.
+    n = len(by_pat)
     won = by_pat[(by_pat.mean_diff > 0) & by_pat.reject_holm]
-    print(f"\n  Khung hai giai đoạn thắng có ý nghĩa ở "
-          f"{len(won)}/{len(by_pat)} nhóm"
-          + (f": {', '.join(won.pattern)}" if len(won) else ""))
+    lost = by_pat[(by_pat.mean_diff < 0) & by_pat.reject_holm]
+    tie = by_pat[~by_pat.reject_holm]
+
+    def _names(sub: pd.DataFrame) -> str:
+        return f": {', '.join(sub.pattern)}" if len(sub) else ""
+
+    print(f"\n  Phân định theo chiều và mức ý nghĩa (tổng {n} nhóm):")
+    print(f"    Hai giai đoạn TỐT HƠN có ý nghĩa : "
+          f"{len(won)}/{n}{_names(won)}")
+    print(f"    Hai giai đoạn KÉM HƠN có ý nghĩa : "
+          f"{len(lost)}/{n}{_names(lost)}")
+    print(f"    Không đủ bằng chứng khác biệt    : "
+          f"{len(tie)}/{n}{_names(tie)}")
+    print("\n  Lưu ý khi viết bài: 'không thắng' KHÁC 'không có khác biệt'. "
+          "Với cỡ mẫu\n  hàng chục nghìn chuỗi, phần lớn nhóm sẽ đạt ý nghĩa "
+          "thống kê; cột độ_lớn\n  mới cho biết khác biệt có đáng kể trong "
+          "thực tế hay không.")
     by_pat.to_csv(out_dir / filename, index=False)
 
 
@@ -806,7 +926,9 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
                   "p_wilcoxon", "cohen_d", "độ_lớn", "ý_nghĩa"]].rename(
         columns={"model_b": "so_với", "mean_diff": "chênh_MAE",
                  "b_win_rate": "tỷ_lệ_thắng"})
-    print(show.round(5).to_string(index=False))
+    show = show.round(5)
+    show["p_wilcoxon"] = table.p_wilcoxon.map(_fmt_p)
+    print(show.to_string(index=False))
     print("\n  chênh_MAE âm nghĩa là mô hình tham chiếu tốt hơn.")
     print("  tỷ_lệ_thắng là tỷ lệ chuỗi mà mô hình kia thắng tham chiếu.")
     print("  Cột ý_nghĩa đã hiệu chỉnh Holm cho nhiều phép so sánh.")
@@ -851,7 +973,8 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
                 print(f"    {r['model_a']}\n      vs {r['model_b']}")
                 print(f"      chênh MAE trung bình : {r['mean_diff']:+.5f}")
                 print(f"      tỷ lệ chuỗi B thắng  : {r['b_win_rate']:.1%}")
-                print(f"      p (Wilcoxon)         : {r['p_wilcoxon']:.3e}")
+                print(f"      p (Wilcoxon)         : "
+                      f"{_fmt_p(r['p_wilcoxon'])}")
                 print(f"      độ lớn hiệu ứng      : {r['cohen_d']:.4f} "
                       f"({r['độ_lớn']})")
                 print(f"      kết luận             : {r['verdict']}")
@@ -894,10 +1017,12 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
     #       sinh ra từ dữ liệu, nên p-value bị lạc quan và KHÔNG được trình
     #       bày như bằng chứng xác nhận.
     if series is not None:
-        fixed_pair = ("Single-Stage", "Two-Stage")
+        # Dùng chung hằng số với phần mô tả để hai mục không thể lệch nhau.
+        fixed_pair = RQ3_FIXED_PAIR
         _rq3_significance(
             losses, series, fixed_pair, out_dir,
-            title="RQ3 (CHÍNH, xác nhận) — cặp cố định khai báo trước",
+            title="RQ3 (CHÍNH, xác nhận) — cặp cố định, KHỚP hàm mất mát "
+                  "(squared vs squared)",
             filename="significance_rq3_fixed_pair.csv",
             caveat=None)
 

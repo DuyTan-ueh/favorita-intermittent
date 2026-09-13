@@ -257,8 +257,24 @@ artifacts/<run_name>/
     metrics_by_fold.csv       Chỉ số từng fold × mô hình × bộ đặc trưng
     metrics_by_pattern.csv    Chỉ số theo nhóm mẫu nhu cầu (RQ3)
     summary.csv               Bảng tổng hợp (RQ1)
+    seed_stability.csv        Độ ổn định qua nhiều seed, theo từng cặp
+    matched_loss_comparison.csv  So sánh theo mức độ khớp hàm mất mát
+    recommended_model.csv     Xếp hạng sau khi lọc theo độ chệch (hậu nghiệm)
+    significance_vs_best.csv  Mọi mô hình so với mô hình tốt nhất (mô tả)
+    significance_rq1.csv      Cặp ghép RQ1, có cột phân loại mức độ khớp
+    rq3_fixed_pair_by_pattern.csv      RQ3 Bảng A — cặp cố định, khớp loss
+    significance_rq3_fixed_pair.csv    RQ3 Bảng A — kiểm định
+    rq3_exploratory_best_by_pattern.csv  RQ3 Bảng B — khám phá
+    significance_rq3_exploratory.csv     RQ3 Bảng B — kiểm định
+    checkpoints/              Kết quả từng (fold, seed), dùng lại khi chạy lại
   gap_comparison.csv          So sánh gap = 0 và gap = 7
 ```
+
+**Bảng A và Bảng B của RQ3 không thay thế được cho nhau.** Bảng A dùng cặp
+cố định và KHỚP hàm mất mát (`Single-Stage[squared]` vs `Two-Stage`, cả hai
+đều dùng squared) — đây là bảng duy nhất diễn giải được như bằng chứng xác
+nhận cho câu hỏi về kiến trúc. Bảng B chọn biến thể tốt nhất của mỗi kiến
+trúc dựa trên chính tập kiểm tra đang phân tích, nên chỉ mang tính khám phá.
 
 ## Trạng thái
 
