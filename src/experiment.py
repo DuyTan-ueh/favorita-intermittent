@@ -31,30 +31,37 @@ NON_FEATURES = {"y", "y_occurrence", "y_magnitude", "date",
                 "store_nbr", "item_nbr"}
 
 # --------------------------------------------------------------------------- #
-# Cặp so sánh CỐ ĐỊNH của RQ3
+# Cặp so sánh CỐ ĐỊNH của RQ3 — nhận diện theo DỮ LIỆU, không theo TÊN
 # --------------------------------------------------------------------------- #
-# Cặp này phải KHỚP CHÍNH XÁC hàm mất mát, nếu không RQ3 sẽ không trả lời được
-# câu hỏi nó tự đặt ra.
+# Bản v15 dùng hằng số ``RQ3_FIXED_PAIR = ("Single-Stage[squared]", "Two-
+# Stage")`` — một tên hardcode. Điều này đúng khi ``single_stage_objectives``
+# có NHIỀU phần tử (Phase A: tweedie/absolute/squared, nên squared bị đóng
+# ngoặc để phân biệt với tweedie mặc định), nhưng SAI khi cấu hình chỉ có một
+# objective (Phase B: ``single_stage_objectives: [squared]``) — khi đó
+# ``run_fold`` gán nhãn KHÔNG ngoặc "Single-Stage" cho chính squared, nên tên
+# hardcode "Single-Stage[squared]" không tồn tại trong kết quả và toàn bộ
+# Bảng A bị bỏ qua một cách im lặng (chỉ in cảnh báo), dù dữ liệu squared-vs-
+# squared vẫn có sẵn, chỉ bị gọi nhầm tên.
 #
-# Bản trước dùng ("Single-Stage", "Two-Stage") — hai nhãn mặc định. Cặp đó cố
-# định thật (khai báo trước khi xem kết quả test), nhưng "Single-Stage" mặc
-# định là Tweedie còn "Two-Stage" mặc định là squared, nên kiến trúc VÀ hàm
-# mất mát thay đổi cùng lúc. Chênh lệch quan sát được khi đó không quy về
-# riêng kiến trúc được — đúng thứ mà ``_matched_loss_comparison`` đã cảnh báo
-# ở phần RQ1, tạo ra mâu thuẫn nội bộ giữa hai mục của cùng một báo cáo.
-#
-# Chọn squared làm cặp chính (thay vì absolute) vì: độ chệch của cả hai mô
-# hình đều gần 1, nên hiệu ứng không bị bóp méo bởi hiện tượng dự báo thiếu
-# nặng vốn thấy ở nhóm absolute; và đây cũng chính là cặp đã được kiểm tra độ
-# ổn định qua nhiều seed ở ``_seed_stability``.
-#
-# LƯU Ý về quy ước đặt tên: ``run_fold`` gán nhãn ngắn "Two-Stage" cho phần tử
-# ĐẦU TIÊN của ``experiment.stage2_objectives`` (mặc định là ``squared``), và
-# "Single-Stage[squared]" cho biến thể squared của mô hình một giai đoạn. Nếu
-# đổi thứ tự ``stage2_objectives`` trong cấu hình thì nhãn "Two-Stage" sẽ trỏ
-# sang hàm mất mát khác và cặp dưới đây KHÔNG còn khớp — ``_assert_rq3_pair_
-# matched`` kiểm tra đúng tình huống đó và cảnh báo.
-RQ3_FIXED_PAIR = ("Single-Stage[squared]", "Two-Stage")
+# Sửa: xác định cặp qua cột ``arch``/``loss`` có thật trong ``results`` —
+# không quan tâm quy ước đặt tên của ``run_fold`` sinh ra chuỗi hiển thị nào.
+# Đây là cách tiếp cận ``_matched_loss_comparison`` đã dùng đúng ngay từ đầu.
+def _find_matched_squared_pair(results: pd.DataFrame,
+                               feature_set: str = "full"
+                               ) -> tuple[str, str] | None:
+    """Tìm tên model THỰC TẾ của cặp squared-vs-squared tại một feature_set.
+
+    Trả về ``(tên_single, tên_hai_giai_đoạn)`` nếu tìm thấy đúng một biến thể
+    squared cho mỗi kiến trúc, hoặc ``None`` nếu thiếu — không đoán, không có
+    giá trị mặc định ngầm.
+    """
+    sub = results[(results.feature_set == feature_set)
+                  & (results.loss == "squared")]
+    single = sub.loc[sub.arch == "Single-Stage", "model"].unique()
+    two = sub.loc[sub.arch == "Two-Stage", "model"].unique()
+    if len(single) != 1 or len(two) != 1:
+        return None
+    return (str(single[0]), str(two[0]))
 
 # Giá trị p nhỏ hơn ngưỡng này bị làm tròn thành 0.0 do giới hạn số học dấu
 # phẩy động. In "p = 0" là sai về bản chất: xác suất không bằng không, chỉ là
@@ -813,17 +820,22 @@ def _summarise(results: pd.DataFrame, strat: pd.DataFrame | None,
     full = strat[strat.feature_set.isin(["full", "-"])]
 
     # ---- BẢNG A (CHÍNH): cặp CỐ ĐỊNH, KHỚP hàm mất mát ----
-    # Cặp được cố định trước khi xem kết quả test VÀ dùng chung một hàm mất
-    # mát (xem chú thích ở ``RQ3_FIXED_PAIR``). Hai điều kiện này phải có đủ:
-    # cố định mà không khớp hàm mất mát thì vẫn không tách được ảnh hưởng của
-    # kiến trúc khỏi ảnh hưởng của hàm mất mát.
-    fixed_pair = RQ3_FIXED_PAIR
-    missing = [m for m in fixed_pair if m not in set(full.model)]
-    if missing:
-        print(f"\n  [BỎ QUA BẢNG A] thiếu mô hình {missing} trong kết quả.")
+    # Cặp được xác định bằng cột arch/loss trong ``results`` (xem
+    # ``_find_matched_squared_pair``), không phải bằng tên hardcode — nên
+    # nhận đúng cặp squared-vs-squared bất kể config có bao nhiêu objective.
+    fixed_pair = _find_matched_squared_pair(results)
+    if fixed_pair is None:
+        print("\n  [BỎ QUA BẢNG A] không tìm thấy đúng 1 biến thể squared cho "
+              "mỗi kiến trúc ở feature_set='full'.")
         print("  Bảng A cần cặp khớp hàm mất mát; hãy bật 'squared' trong cả")
         print("  'single_stage_objectives' lẫn 'stage2_objectives' rồi chạy "
               "lại.\n  KHÔNG dùng Bảng B thay thế — đó là phân tích khám phá.")
+    elif any(m not in set(full.model) for m in fixed_pair):
+        # Phòng hờ: results có cặp squared nhưng strat (theo pattern) lại
+        # thiếu — không nên xảy ra cùng một lần chạy, nhưng nếu xảy ra thì
+        # báo rõ thay vì để KeyError ở _print_rq3_table.
+        print(f"\n  [BỎ QUA BẢNG A] tìm thấy cặp {fixed_pair} theo arch/loss "
+              f"nhưng thiếu trong dữ liệu phân nhóm theo pattern.")
     else:
         _assert_rq3_pair_matched(results, fixed_pair)
         _print_rq3_table(
@@ -936,6 +948,64 @@ def _rq3_significance(losses: pd.DataFrame, series: pd.DataFrame,
     by_pat.to_csv(out_dir / filename, index=False)
 
 
+def _build_rq1_pair_groups(results: pd.DataFrame, feature_set: str = "full"
+                           ) -> dict:
+    """Dựng 3 nhóm cặp so sánh của RQ1 bằng cột arch/loss có thật.
+
+    Bản v15 hardcode tên hiển thị (vd "Single-Stage[squared]|full") — đúng
+    cho Phase A (nhiều objective nên tên có ngoặc) nhưng SAI khi config chỉ
+    có một objective (Phase B: tên không ngoặc), khiến toàn bộ exact_match/
+    analogy bị lọc rỗng và cặp squared-vs-squared thực tế bị rơi vào nhóm
+    "unmatched_reference" — đúng cặp cần nhất nhưng gắn nhãn "không dùng làm
+    bằng chứng". Sửa: dựng cặp bằng cột arch/loss, rồi mới suy ra tên hiển
+    thị — không đoán qua tên.
+
+    Returns
+    -------
+    dict với ba khoá ``exact_match``, ``analogy``, ``unmatched_reference``
+    (mỗi giá trị là list các tuple tên model_key) và ``unmatched_label``
+    (chuỗi mô tả loss thực tế của cặp unmatched, rỗng nếu không có cặp đó).
+    """
+    lut = (results.loc[results.feature_set == feature_set,
+                       ["model", "arch", "loss"]]
+           .dropna(subset=["arch"]).drop_duplicates())
+    lut["model_key"] = lut["model"] + "|" + feature_set
+    single_by_loss = dict(zip(lut.loc[lut.arch == "Single-Stage", "loss"],
+                              lut.loc[lut.arch == "Single-Stage", "model_key"]))
+    two_by_loss = dict(zip(lut.loc[lut.arch == "Two-Stage", "loss"],
+                          lut.loc[lut.arch == "Two-Stage", "model_key"]))
+
+    # Khớp chính xác: mọi hàm mất mát mà CẢ HAI kiến trúc đều có chạy.
+    exact_match = [(single_by_loss[loss], two_by_loss[loss])
+                  for loss in single_by_loss.keys() & two_by_loss.keys()]
+
+    # Tương đồng phân phối: cặp domain-specific Tweedie(Single)–Gamma(Two),
+    # không phải "cùng loss" nên xác định riêng, không suy từ vòng lặp trên.
+    analogy = []
+    if "tweedie" in single_by_loss and "gamma" in two_by_loss:
+        analogy = [(single_by_loss["tweedie"], two_by_loss["gamma"])]
+
+    # Mốc tham chiếu chưa khớp: cấu hình MẶC ĐỊNH (tên không ngoặc) của mỗi
+    # kiến trúc — chỉ xếp vào nhóm này nếu hàm mất mát THỰC SỰ khác nhau.
+    # Nếu trùng loss thì cặp này đã nằm trong exact_match ở trên rồi, không
+    # lặp lại dưới một nhãn ngụ ý "chưa khớp" sai sự thật.
+    unmatched_reference: list[tuple[str, str]] = []
+    unmatched_label = ""
+    default_single = f"Single-Stage|{feature_set}"
+    default_two = f"Two-Stage|{feature_set}"
+    keys = set(lut.model_key)
+    if default_single in keys and default_two in keys:
+        loss_s = lut.loc[lut.model_key == default_single, "loss"].iloc[0]
+        loss_t = lut.loc[lut.model_key == default_two, "loss"].iloc[0]
+        if loss_s != loss_t:
+            unmatched_reference = [(default_single, default_two)]
+            unmatched_label = f"{loss_s} vs {loss_t}"
+
+    return {"exact_match": exact_match, "analogy": analogy,
+            "unmatched_reference": unmatched_reference,
+            "unmatched_label": unmatched_label}
+
+
 def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
                       out_dir: Path, gap: int,
                       series: pd.DataFrame | None = None,
@@ -990,22 +1060,17 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
     # So sánh trực tiếp cặp quan trọng nhất của RQ1
     pooled = (losses.groupby(["model_key", "store_nbr", "item_nbr"],
                              as_index=False).agg(mae=("mae", "mean")))
+
     # Ba nhóm so sánh, KHÔNG gộp chung một nhãn — mỗi nhóm trả lời một câu
-    # hỏi khác nhau và có độ chặt chẽ khác nhau.
-    exact_match_pairs = [
-        ("Single-Stage[squared]|full", "Two-Stage|full"),
-        ("Single-Stage[absolute]|full", "Two-Stage[absolute]|full"),
-    ]
-    analogy_pairs = [
-        ("Single-Stage|full", "Two-Stage[gamma]|full"),
-    ]
-    # Cặp mặc định của mỗi kiến trúc (Tweedie vs squared) — hai hàm mất mát
-    # khác nhau, không thuộc nhóm nào ở trên. Giữ lại vì đây là điểm khởi đầu
-    # đã dẫn tới toàn bộ điều tra về hàm mất mát, nhưng không được gọi là
-    # "khớp" dưới bất kỳ hình thức nào.
-    unmatched_reference_pairs = [
-        ("Single-Stage|full", "Two-Stage|full"),
-    ]
+    # hỏi khác nhau và có độ chặt chẽ khác nhau (xem _build_rq1_pair_groups).
+    groups = _build_rq1_pair_groups(results, feature_set="full")
+    exact_match_pairs = groups["exact_match"]
+    analogy_pairs = groups["analogy"]
+    unmatched_reference_pairs = groups["unmatched_reference"]
+    unmatched_label = ("MỐC THAM CHIẾU CHƯA KHỚP — để đối chiếu"
+                       if not groups["unmatched_label"] else
+                       f"MỐC THAM CHIẾU CHƯA KHỚP — "
+                       f"{groups['unmatched_label']}, để đối chiếu")
 
     def _print_group(label: str, pairs: list) -> list:
         rows = [significance.paired_test_by_series(pooled, a, b)
@@ -1036,9 +1101,7 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
             analogy_pairs):
         r["category"] = "distributional_analogy"
         all_rows.append(r)
-    for r in _print_group(
-            "MỐC THAM CHIẾU CHƯA KHỚP — Tweedie vs squared, để đối chiếu",
-            unmatched_reference_pairs):
+    for r in _print_group(unmatched_label, unmatched_reference_pairs):
         r["category"] = "unmatched_reference"
         all_rows.append(r)
 
@@ -1061,14 +1124,21 @@ def _run_significance(losses: pd.DataFrame, results: pd.DataFrame,
     #       sinh ra từ dữ liệu, nên p-value bị lạc quan và KHÔNG được trình
     #       bày như bằng chứng xác nhận.
     if series is not None:
-        # Dùng chung hằng số với phần mô tả để hai mục không thể lệch nhau.
-        fixed_pair = RQ3_FIXED_PAIR
-        _rq3_significance(
-            losses, series, fixed_pair, out_dir,
-            title="RQ3 (CHÍNH, xác nhận) — cặp cố định, KHỚP hàm mất mát "
-                  "(squared vs squared)",
-            filename="significance_rq3_fixed_pair.csv",
-            caveat=None)
+        # Xác định cặp bằng arch/loss thực tế (xem _find_matched_squared_pair)
+        # — dùng chung hàm với phần mô tả ở _summarise nên hai mục không thể
+        # lệch nhau, và không phụ thuộc quy ước đặt tên của run_fold.
+        fixed_pair = _find_matched_squared_pair(results)
+        if fixed_pair is None:
+            print("\n  [BỎ QUA KIỂM ĐỊNH RQ3 — CẶP CỐ ĐỊNH] không tìm thấy "
+                  "đúng 1 biến thể squared\n  cho mỗi kiến trúc ở "
+                  "feature_set='full'.")
+        else:
+            _rq3_significance(
+                losses, series, fixed_pair, out_dir,
+                title="RQ3 (CHÍNH, xác nhận) — cặp cố định, KHỚP hàm mất mát "
+                      "(squared vs squared)",
+                filename="significance_rq3_fixed_pair.csv",
+                caveat=None)
 
         if best_pair and all(best_pair) and tuple(best_pair) != fixed_pair:
             _rq3_significance(

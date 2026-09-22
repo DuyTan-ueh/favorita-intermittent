@@ -1226,50 +1226,108 @@ class TestRQ3SignificancePairSeparation:
 
 
 # --------------------------------------------------------------------------- #
-# Cặp cố định RQ3 phải KHỚP hàm mất mát
+# Cặp cố định RQ3 phải KHỚP hàm mất mát — nhận diện theo arch/loss
 # --------------------------------------------------------------------------- #
-class TestRQ3FixedPairIsMatchedLoss:
-    """Khoá lại lỗi thiết kế: cặp CHÍNH của RQ3 từng là Tweedie vs squared.
-
-    Cặp đó cố định thật (khai báo trước khi xem test) nhưng kiến trúc và hàm
-    mất mát thay đổi cùng lúc, nên chênh lệch không quy về riêng kiến trúc
-    được — mâu thuẫn với chính cảnh báo mà phần RQ1 đưa ra. Nay cặp chính
-    phải khớp hàm mất mát (squared vs squared).
+class TestFindMatchedSquaredPair:
+    """Khoá lại lỗi v15: ``RQ3_FIXED_PAIR`` hardcode tên "Single-Stage
+    [squared]" — đúng khi ``single_stage_objectives`` có NHIỀU phần tử
+    (Phase A, nên squared bị đóng ngoặc để phân biệt tweedie mặc định), SAI
+    khi config chỉ có một objective (Phase B: nhãn không ngoặc). Hậu quả
+    thật đã xảy ra: Bảng A bị bỏ qua ở Phase B dù dữ liệu squared-vs-squared
+    vẫn tồn tại, chỉ là mang tên khác. Sửa bằng cách nhận diện qua cột
+    arch/loss có thật, không qua tên hiển thị.
     """
 
-    @staticmethod
-    def _results(single_loss: str, two_loss: str) -> pd.DataFrame:
-        return pd.DataFrame([
+    def test_phase_a_style_multi_objective_finds_bracketed_name(self):
+        """Phase A: nhiều objective -> squared bị đóng ngoặc như trước nay."""
+        from src.experiment import _find_matched_squared_pair
+        results = pd.DataFrame([
+            {"model": "Single-Stage", "arch": "Single-Stage",
+             "loss": "tweedie", "feature_set": "full"},
+            {"model": "Single-Stage[absolute]", "arch": "Single-Stage",
+             "loss": "absolute", "feature_set": "full"},
             {"model": "Single-Stage[squared]", "arch": "Single-Stage",
-             "loss": single_loss, "feature_set": "full", "wape": 0.516},
+             "loss": "squared", "feature_set": "full"},
             {"model": "Two-Stage", "arch": "Two-Stage",
-             "loss": two_loss, "feature_set": "full", "wape": 0.515},
+             "loss": "squared", "feature_set": "full"},
+            {"model": "Two-Stage[gamma]", "arch": "Two-Stage",
+             "loss": "gamma", "feature_set": "full"},
+            {"model": "Two-Stage[absolute]", "arch": "Two-Stage",
+             "loss": "absolute", "feature_set": "full"},
         ])
+        assert (_find_matched_squared_pair(results)
+                == ("Single-Stage[squared]", "Two-Stage"))
 
-    def test_default_fixed_pair_is_not_the_old_mismatched_pair(self):
-        from src.experiment import RQ3_FIXED_PAIR
-        assert RQ3_FIXED_PAIR != ("Single-Stage", "Two-Stage")
-        assert RQ3_FIXED_PAIR == ("Single-Stage[squared]", "Two-Stage")
+    def test_phase_b_style_single_objective_finds_unbracketed_name(self):
+        """Phase B: chỉ squared -> KHÔNG đóng ngoặc. Đây đúng là tình huống
+        v15 bỏ sót — trước bản vá này, Bảng A bị bỏ qua ở đúng trường hợp
+        này dù dữ liệu tồn tại."""
+        from src.experiment import _find_matched_squared_pair
+        results = pd.DataFrame([
+            {"model": "Single-Stage", "arch": "Single-Stage",
+             "loss": "squared", "feature_set": "full"},
+            {"model": "Two-Stage", "arch": "Two-Stage",
+             "loss": "squared", "feature_set": "full"},
+        ])
+        assert (_find_matched_squared_pair(results)
+                == ("Single-Stage", "Two-Stage"))
 
-    def test_matched_pair_passes_check(self):
-        from src.experiment import RQ3_FIXED_PAIR, _assert_rq3_pair_matched
-        res = self._results("squared", "squared")
-        assert _assert_rq3_pair_matched(res, RQ3_FIXED_PAIR) is True
+    def test_returns_none_when_squared_missing_on_one_side(self):
+        from src.experiment import _find_matched_squared_pair
+        results = pd.DataFrame([
+            {"model": "Single-Stage", "arch": "Single-Stage",
+             "loss": "tweedie", "feature_set": "full"},
+            {"model": "Two-Stage", "arch": "Two-Stage",
+             "loss": "squared", "feature_set": "full"},
+        ])
+        assert _find_matched_squared_pair(results) is None
 
-    def test_mismatched_pair_is_detected_and_warns(self, capsys):
+    def test_scoped_to_requested_feature_set_only(self):
+        """Squared ở feature_set khác 'full' không được tính vào."""
+        from src.experiment import _find_matched_squared_pair
+        results = pd.DataFrame([
+            {"model": "Single-Stage", "arch": "Single-Stage",
+             "loss": "squared", "feature_set": "historical"},
+            {"model": "Two-Stage", "arch": "Two-Stage",
+             "loss": "squared", "feature_set": "historical"},
+        ])
+        assert _find_matched_squared_pair(results, feature_set="full") is None
+        assert (_find_matched_squared_pair(results, feature_set="historical")
+                == ("Single-Stage", "Two-Stage"))
+
+    def test_dynamic_pair_still_passes_matched_loss_assert(self):
+        from src.experiment import (_find_matched_squared_pair,
+                                    _assert_rq3_pair_matched)
+        results = pd.DataFrame([
+            {"model": "Single-Stage", "arch": "Single-Stage",
+             "loss": "squared", "feature_set": "full"},
+            {"model": "Two-Stage", "arch": "Two-Stage",
+             "loss": "squared", "feature_set": "full"},
+        ])
+        pair = _find_matched_squared_pair(results)
+        assert _assert_rq3_pair_matched(results, pair) is True
+
+    def test_mismatched_pair_is_still_detected_and_warns(self, capsys):
         """Đổi thứ tự stage2_objectives làm nhãn 'Two-Stage' trỏ sang hàm mất
         mát khác — phải bị phát hiện, không được im lặng."""
-        from src.experiment import RQ3_FIXED_PAIR, _assert_rq3_pair_matched
-        res = self._results("squared", "gamma")
-        assert _assert_rq3_pair_matched(res, RQ3_FIXED_PAIR) is False
+        from src.experiment import _assert_rq3_pair_matched
+        res = pd.DataFrame([
+            {"model": "Single-Stage[squared]", "arch": "Single-Stage",
+             "loss": "squared", "feature_set": "full"},
+            {"model": "Two-Stage", "arch": "Two-Stage",
+             "loss": "gamma", "feature_set": "full"},
+        ])
+        pair = ("Single-Stage[squared]", "Two-Stage")
+        assert _assert_rq3_pair_matched(res, pair) is False
         out = capsys.readouterr().out
         assert "CẢNH BÁO" in out and "squared" in out and "gamma" in out
 
-    def test_check_is_silent_when_loss_column_absent(self):
+    def test_assert_is_silent_when_loss_column_absent(self):
         """Checkpoint cũ không có cột 'loss' — không được báo động giả."""
-        from src.experiment import RQ3_FIXED_PAIR, _assert_rq3_pair_matched
+        from src.experiment import _assert_rq3_pair_matched
         res = pd.DataFrame([{"model": "Two-Stage", "wape": 0.5}])
-        assert _assert_rq3_pair_matched(res, RQ3_FIXED_PAIR) is True
+        pair = ("Single-Stage[squared]", "Two-Stage")
+        assert _assert_rq3_pair_matched(res, pair) is True
 
 
 class TestPValueReporting:
@@ -1350,3 +1408,80 @@ class TestRQ3DirectionalSummary:
                           tmp_path, title="T", filename="f.csv")
         out = capsys.readouterr().out
         assert " 0.00000\n" not in out.replace("\r", "")
+
+
+class TestBuildRQ1PairGroups:
+    """Khoá lại lỗi v15: 3 nhóm cặp RQ1 (exact_match/analogy/unmatched_
+    reference) từng hardcode tên hiển thị, khiến ở Phase B (chỉ 1 objective)
+    cặp squared-vs-squared bị xếp nhầm vào 'unmatched_reference' — đúng
+    nhãn mà chính code in cảnh báo 'KHÔNG dùng làm bằng chứng'.
+    """
+
+    @staticmethod
+    def _phase_a_style() -> pd.DataFrame:
+        """Nhiều objective mỗi kiến trúc — giống hệt cấu hình mặc định."""
+        return pd.DataFrame([
+            {"model": "Single-Stage", "arch": "Single-Stage",
+             "loss": "tweedie", "feature_set": "full"},
+            {"model": "Single-Stage[absolute]", "arch": "Single-Stage",
+             "loss": "absolute", "feature_set": "full"},
+            {"model": "Single-Stage[squared]", "arch": "Single-Stage",
+             "loss": "squared", "feature_set": "full"},
+            {"model": "Two-Stage", "arch": "Two-Stage",
+             "loss": "squared", "feature_set": "full"},
+            {"model": "Two-Stage[gamma]", "arch": "Two-Stage",
+             "loss": "gamma", "feature_set": "full"},
+            {"model": "Two-Stage[absolute]", "arch": "Two-Stage",
+             "loss": "absolute", "feature_set": "full"},
+        ])
+
+    @staticmethod
+    def _phase_b_style() -> pd.DataFrame:
+        """Chỉ squared cho cả hai kiến trúc — cấu hình Phase B thật."""
+        return pd.DataFrame([
+            {"model": "Single-Stage", "arch": "Single-Stage",
+             "loss": "squared", "feature_set": "full"},
+            {"model": "Two-Stage", "arch": "Two-Stage",
+             "loss": "squared", "feature_set": "full"},
+        ])
+
+    def test_phase_a_style_reproduces_original_hardcoded_pairs(self):
+        """Không được có hồi quy: Phase A phải ra đúng 2 exact_match + 1
+        analogy + 1 unmatched như bản v15 hardcode, chỉ khác là suy ra từ
+        dữ liệu thay vì gõ tay."""
+        from src.experiment import _build_rq1_pair_groups
+        g = _build_rq1_pair_groups(self._phase_a_style())
+        assert set(g["exact_match"]) == {
+            ("Single-Stage[squared]|full", "Two-Stage|full"),
+            ("Single-Stage[absolute]|full", "Two-Stage[absolute]|full"),
+        }
+        assert g["analogy"] == [("Single-Stage|full", "Two-Stage[gamma]|full")]
+        assert g["unmatched_reference"] == [("Single-Stage|full", "Two-Stage|full")]
+        assert g["unmatched_label"] == "tweedie vs squared"
+
+    def test_phase_b_style_reclassifies_as_exact_match_not_unmatched(self):
+        """Đây chính là bug đã phát hiện qua audit: cặp squared-vs-squared
+        của Phase B phải rơi vào exact_match, KHÔNG phải unmatched_reference."""
+        from src.experiment import _build_rq1_pair_groups
+        g = _build_rq1_pair_groups(self._phase_b_style())
+        assert g["exact_match"] == [("Single-Stage|full", "Two-Stage|full")]
+        assert g["analogy"] == []
+        assert g["unmatched_reference"] == []          # không còn bị trùng nhãn
+        assert g["unmatched_label"] == ""
+
+    def test_no_pair_duplicated_across_groups(self):
+        """Một cặp cụ thể không được xuất hiện ở hai nhóm cùng lúc — tránh
+        vừa 'khớp chính xác' vừa 'chưa khớp' cho cùng một dòng dữ liệu."""
+        from src.experiment import _build_rq1_pair_groups
+        for style in (self._phase_a_style(), self._phase_b_style()):
+            g = _build_rq1_pair_groups(style)
+            all_pairs = g["exact_match"] + g["analogy"] + g["unmatched_reference"]
+            assert len(all_pairs) == len(set(all_pairs))
+
+    def test_scoped_to_requested_feature_set(self):
+        from src.experiment import _build_rq1_pair_groups
+        df = self._phase_b_style()
+        df["feature_set"] = "historical"
+        assert _build_rq1_pair_groups(df, feature_set="full")["exact_match"] == []
+        assert (_build_rq1_pair_groups(df, feature_set="historical")["exact_match"]
+                == [("Single-Stage|historical", "Two-Stage|historical")])
